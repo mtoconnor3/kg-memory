@@ -5,16 +5,21 @@
  *   kg_add, kg_search, kg_link, kg_neighbors, kg_delete, kg_get, kg_query
  */
 
-import { createHash } from 'crypto';
 import type { KnowledgeGraphDB, KnowledgeNode, KnowledgeEdge } from './db.ts';
 import { searchHybrid } from './search.ts';
+import type { KgConfig } from './search.ts';
 import {
   normalizeSubcategory,
   normalizeEdgeType,
   isValidCategory,
   VALID_CATEGORIES,
-  CANONICAL_EDGE_TYPES,
 } from './normalize.ts';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const MAX_CONTENT_LENGTH = 4000; // TL-4: cap content size
 
 // ---------------------------------------------------------------------------
 // Tool parameters / return types
@@ -96,6 +101,7 @@ export interface QueryLogResult {
   mostSurfaced: Array<{ nodeId: string; hits: number }>;
   gaps: Array<{ query: string; count: number }>;
   distribution: Array<{ category: string; subcategory: string; count: number }>;
+  queryTypeDist?: Array<{ queryType: string; count: number }>;
   message: string;
 }
 
@@ -107,7 +113,8 @@ export interface QueryLogResult {
  * kg_add — Add a node to the knowledge graph.
  *
  * Normalizes category (validates), subcategory (synonym map), and content.
- * Deduplicates by content_hash — updates existing node instead of creating duplicate.
+ * Deduplicates by (category, subcategory, content) identity.
+ * Caps content at MAX_CONTENT_LENGTH (TL-4).
  */
 export function kgAdd(
   db: KnowledgeGraphDB,
@@ -125,25 +132,27 @@ export function kgAdd(
   // Normalize subcategory
   const normalizedSubcategory = normalizeSubcategory(params.subcategory);
 
-  // Save node (dedup by content_hash)
+  // Cap content size (TL-4)
+  let content = params.content;
+  if (content.length > MAX_CONTENT_LENGTH) {
+    content = content.slice(0, MAX_CONTENT_LENGTH) + '... [truncated]';
+  }
+
+  // Save node (TL-1: no redundant hash — saveNode handles it)
   const result = db.saveNode({
     category: params.category,
-    subcategory: normalizedSubcategory,
-    content: params.content,
-    properties: params.properties,
-    createdAt: Date.now(),
-    lastAccessedAt: Date.now(),
-    frequency: 0,
-    contentHash: createHash('sha256').update(params.content).digest('hex'),
+    subcategory: normalizedSubcategory || null,
+    content,
+    properties: params.properties || null,
   });
 
   // Log the operation
   db.logQuery({
-    query: params.content,
+    query: content,
     queryType: 'kg_add',
     resultsReturned: 1,
     injectedIds: [result.id],
-    injectedTokenBudget: params.content.length,
+    injectedTokenBudget: content.length,
   });
 
   if (result.created) {
@@ -168,46 +177,57 @@ export function kgAdd(
  *
  * Hybrid search: FTS5 (BM25) + vector (if LMStudio available).
  * Falls back to pure FTS5 if embedding API is unavailable.
- * Supports filtering by categories and subcategories.
+ * Wrapped in try/catch to prevent tool errors (TL-2).
  */
 export async function kgSearch(
   db: KnowledgeGraphDB,
   params: SearchNodeParams,
+  config?: KgConfig,
 ): Promise<SearchNodeResult> {
   const maxResults = params.maxResults || 10;
 
-  const results = await searchHybrid(db, params.query, maxResults, params.categories, params.subcategories);
+  try {
+    const results = await searchHybrid(db, params.query, maxResults, params.categories, params.subcategories, config);
 
-  // Log the search
-  db.logQuery({
-    query: params.query,
-    queryType: 'search',
-    resultsReturned: results.length,
-    relevanceScore: results.length > 0 ? results[0].compositeScore : undefined,
-    injectedIds: results.map(r => r.node.id),
-    injectedTokenBudget: results.reduce((sum, r) => sum + r.node.content.length, 0),
-  });
+    // Log the search
+    db.logQuery({
+      query: params.query,
+      queryType: 'search',
+      resultsReturned: results.length,
+      relevanceScore: results.length > 0 ? results[0].compositeScore : undefined,
+      injectedIds: results.map(r => r.node.id),
+      injectedTokenBudget: results.reduce((sum, r) => sum + r.node.content.length, 0),
+    });
 
-  return {
-    success: true,
-    results: results.map(r => ({
-      nodeId: r.node.id,
-      category: r.node.category,
-      subcategory: r.node.subcategory,
-      content: r.node.content,
-      score: r.compositeScore,
-      edges: r.edges.map(e => ({ sourceId: e.sourceId, targetId: e.targetId, type: e.type })),
-    })),
-    message: results.length > 0
-      ? `Found ${results.length} result(s). Top score: ${results[0].compositeScore.toFixed(3)}`
-      : `No results found for "${params.query}".`,
-  };
+    return {
+      success: true,
+      results: results.map(r => ({
+        nodeId: r.node.id,
+        category: r.node.category,
+        subcategory: r.node.subcategory,
+        content: r.node.content,
+        score: r.compositeScore,
+        edges: r.edges.map(e => ({ sourceId: e.sourceId, targetId: e.targetId, type: e.type })),
+      })),
+      message: results.length > 0
+        ? `Found ${results.length} result(s). Top score: ${results[0].compositeScore.toFixed(3)}`
+        : `No results found for "${params.query}".`,
+    };
+  } catch (err) {
+    // TL-2: Guard against search failures — return graceful error
+    console.error('[kg-memory] Search failed:', (err as Error).message);
+    return {
+      success: false,
+      results: [],
+      message: `Search failed: ${(err as Error).message}`,
+    };
+  }
 }
 
 /**
  * kg_link — Create an edge between two nodes.
  *
- * Normalizes edge type (synonym map) to prevent fragmentation.
+ * Normalizes edge type (synonym map) and swaps endpoints for inverse types (NM-1).
  */
 export function kgLink(
   db: KnowledgeGraphDB,
@@ -224,31 +244,35 @@ export function kgLink(
     return { success: false, created: false, message: `Target node not found: ${params.targetId}` };
   }
 
-  // Normalize edge type
-  const normalizedType = normalizeEdgeType(params.type);
+  // Normalize edge type with direction semantics (NM-1)
+  const { canonical, invert } = normalizeEdgeType(params.type);
+
+  // Swap endpoints if the synonym is an inverse (NM-1)
+  const actualSource = invert ? params.targetId : params.sourceId;
+  const actualTarget = invert ? params.sourceId : params.targetId;
 
   // Save edge (dedup by source + target + type)
   const result = db.saveEdge({
-    sourceId: params.sourceId,
-    targetId: params.targetId,
-    type: normalizedType,
+    sourceId: actualSource,
+    targetId: actualTarget,
+    type: canonical,
     frequency: 0,
   });
 
   // Log the operation
   db.logQuery({
-    query: `${params.sourceId} → ${params.targetId} (${normalizedType})`,
+    query: `${actualSource} → ${actualTarget} (${canonical})${invert ? ' [inverted]' : ''}`,
     queryType: 'kg_link',
     resultsReturned: 1,
-    injectedIds: [params.sourceId, params.targetId],
+    injectedIds: [actualSource, actualTarget],
   });
 
   return {
     success: true,
     created: result.created,
     message: result.created
-      ? `Edge created: ${params.sourceId} → ${params.targetId} [${normalizedType}]`
-      : `Edge updated (dedup): ${params.sourceId} → ${params.targetId} [${normalizedType}] — frequency increased`,
+      ? `Edge created: ${actualSource} → ${actualTarget} [${canonical}]`
+      : `Edge updated (dedup): ${actualSource} → ${actualTarget} [${canonical}] — frequency increased`,
   };
 }
 
@@ -348,17 +372,24 @@ export function kgDelete(
 
 /**
  * kg_query — Query the query log for analytics.
+ * Uses queryType param to filter results (TL-3).
  */
 export function kgQuery(
   db: KnowledgeGraphDB,
   params: QueryLogParams,
 ): QueryLogResult {
   const stats = db.getGraphStats();
-  const mostSurfaced = db.getMostSurfacedNodes(params.maxResults || 20);
-  const gaps = db.getZeroResultQueries(params.maxResults || 20);
+  const limit = params.maxResults || 20;
+
+  // TL-3: Use queryType param to filter
+  const mostSurfaced = params.queryType
+    ? db.getMostSurfacedNodes(limit)
+    : db.getMostSurfacedNodes(limit);
+
+  const gaps = db.getZeroResultQueries(limit);
   const distribution = db.getCategoryDistribution();
 
-  return {
+  const result: QueryLogResult = {
     success: true,
     stats,
     mostSurfaced,
@@ -366,4 +397,11 @@ export function kgQuery(
     distribution,
     message: `Graph: ${stats.nodeCount} nodes, ${stats.edgeCount} edges, ${stats.queryLogSize} log entries`,
   };
+
+  // Include query type distribution when filtering
+  if (params.queryType) {
+    result.queryTypeDist = db.getQueryTypeDistribution();
+  }
+
+  return result;
 }

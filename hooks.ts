@@ -6,7 +6,7 @@
  */
 
 import type { KnowledgeGraphDB, SearchHit } from './db.ts';
-import type { SearchConfig } from './search.ts';
+import type { KgConfig } from './search.ts';
 import { DEFAULT_CONFIG, searchHybrid } from './search.ts';
 
 // ---------------------------------------------------------------------------
@@ -45,6 +45,12 @@ export interface InputContext {
 }
 
 // ---------------------------------------------------------------------------
+// Per-turn injection tracking (HK-7: prevent double injection)
+// ---------------------------------------------------------------------------
+
+const injectedNodeIds = new Set<string>();
+
+// ---------------------------------------------------------------------------
 // Hook implementations
 // ---------------------------------------------------------------------------
 
@@ -54,12 +60,12 @@ export interface InputContext {
 export function onSessionStart(
   db: KnowledgeGraphDB,
   context: SessionStartContext,
-  config: SearchConfig = DEFAULT_CONFIG,
+  config: KgConfig = DEFAULT_CONFIG,
 ): { stats: Record<string, any>; notification?: string } {
   const stats = db.getGraphStats();
 
-  // Create a snapshot for versioning
-  db.createSnapshot(`Session ${context.sessionId} started`);
+  // Create a session marker (replaces snapshots — DB-6)
+  db.createMarker('session_start', `Session ${context.sessionId} started`);
 
   // Build notification message (if UI available)
   let notification: string | undefined;
@@ -80,53 +86,55 @@ export function onSessionStart(
 /**
  * before_agent_start — Inject top-N relevant facts into the system prompt.
  *
- * At session start, query the graph for likely-relevant facts and format
- * them as a concise summary (< injectionBudget tokens).
+ * Uses a single broad search instead of 6 sequential queries (HK-1).
+ * Enforces injectionBudget correctly (HK-2).
+ * Only injects high-trust nodes (HK-3).
+ * Tracks injected IDs to prevent double injection (HK-7).
  */
 export async function onBeforeAgentStart(
   db: KnowledgeGraphDB,
   context: BeforeAgentStartContext,
-  config: SearchConfig = DEFAULT_CONFIG,
+  config: KgConfig = DEFAULT_CONFIG,
 ): Promise<{ injection: string; nodeIds: string[] }> {
-  // Early exit: skip 6 LMStudio calls when the graph is empty.
+  // Early exit: skip when graph is empty
   if (db.getNodeCount() === 0) {
     return { injection: '', nodeIds: [] };
   }
 
-  // Search for broadly relevant facts using multiple queries
-  // (FTS5 uses AND by default, so we search keywords separately and merge)
-  const keywords = ['project', 'decision', 'pattern', 'preference', 'warning', 'fact'];
-  const allResults: SearchHit[] = [];
-  const seenIds = new Set<string>();
+  // Single broad search instead of 6 sequential queries (HK-1)
+  const results = await searchHybrid(db, '', config.maxResults * 2);
 
-  for (const keyword of keywords) {
-    const results = await searchHybrid(db, keyword, config.maxResults);
-    for (const hit of results) {
-      if (!seenIds.has(hit.node.id)) {
-        seenIds.add(hit.node.id);
-        allResults.push(hit);
-      }
-    }
+  if (results.length === 0) {
+    return { injection: '', nodeIds: [] };
   }
 
+  // Filter to high-trust nodes only (HK-3: provenance gating)
+  const trustedResults = results.filter(r => r.node.trust === 'high');
+
   // Sort by score and take top-N
-  allResults.sort((a, b) => b.compositeScore - a.compositeScore);
-  const topResults = allResults.slice(0, config.maxResults);
+  trustedResults.sort((a, b) => b.compositeScore - a.compositeScore);
+  const topResults = trustedResults.slice(0, config.maxResults);
 
   if (topResults.length === 0) {
     return { injection: '', nodeIds: [] };
   }
 
-  // Format as a concise summary
+  // Format with budget enforcement (HK-2: injectionBudget is now typed)
   const injectionParts: string[] = [];
-  let tokenBudget = config.injectionBudget;
+  const injectedIds: string[] = [];
+  let charBudget = config.injectionBudget;
 
   for (const hit of topResults) {
     const line = formatNodeSummary(hit.node);
-    if (line.length >= tokenBudget) break;
+    if (line.length >= charBudget) break;
+
+    // Prevent double injection (HK-7)
+    if (injectedNodeIds.has(hit.node.id)) continue;
 
     injectionParts.push(line);
-    tokenBudget -= line.length;
+    injectedIds.push(hit.node.id);
+    injectedNodeIds.add(hit.node.id);
+    charBudget -= line.length;
   }
 
   const injection = injectionParts.length > 0
@@ -135,7 +143,7 @@ export async function onBeforeAgentStart(
 
   return {
     injection,
-    nodeIds: topResults.map(r => r.node.id),
+    nodeIds: injectedIds,
   };
 }
 
@@ -146,36 +154,47 @@ export async function onBeforeAgentStart(
 export async function onContext(
   db: KnowledgeGraphDB,
   context: ContextHookContext,
-  config: SearchConfig = DEFAULT_CONFIG,
+  config: KgConfig = DEFAULT_CONFIG,
 ): Promise<{ injection: string; nodeIds: string[] }> {
-  // Early exit: skip LMStudio call when the graph is empty.
+  // Early exit: skip when graph is empty
   if (db.getNodeCount() === 0) {
     return { injection: '', nodeIds: [] };
   }
 
-  // Use hybrid search instead of pure FTS5
+  // Use hybrid search with compacted content
   const results = await searchHybrid(db, context.compactedContent, 5, undefined, undefined, config);
 
   if (results.length === 0) {
     return { injection: '', nodeIds: [] };
   }
 
-  // Format as pointers (full details available via kg_get)
-  const injection = results.map(r =>
-    `* [${r.node.category}/${r.node.subcategory}] ${r.node.content.slice(0, 100)}`,
-  ).join('\n');
+  // Format as pointers (HK-6: omit null subcategory)
+  const injection = results
+    .filter(r => !injectedNodeIds.has(r.node.id))  // HK-7: prevent double injection
+    .map(r => {
+      const label = r.node.subcategory
+        ? `${r.node.category}/${r.node.subcategory}`
+        : r.node.category;
+      return `* [${label}] ${r.node.content.slice(0, 100)}`;
+    })
+    .join('\n');
+
+  if (!injection) {
+    return { injection: '', nodeIds: [] };
+  }
+
+  // Track injected IDs (HK-7)
+  const newIds = results.filter(r => !injectedNodeIds.has(r.node.id)).map(r => r.node.id);
+  newIds.forEach(id => injectedNodeIds.add(id));
 
   return {
     injection: `[Knowledge Graph Pointers]\n  ${injection}\n[End Knowledge Graph Pointers]`,
-    nodeIds: results.map(r => r.node.id),
+    nodeIds: newIds,
   };
 }
 
 /**
  * session_before_compact — Inject graph summary into the compaction prompt.
- *
- * This preserves graph knowledge across compaction by including a summary
- * of the entire graph in the compaction prompt.
  */
 export function onSessionBeforeCompact(
   db: KnowledgeGraphDB,
@@ -195,7 +214,7 @@ export function onSessionBeforeCompact(
   }
 
   // Top nodes by frequency (most important facts)
-  const topNodes = db.db.prepare(`
+  const topNodes = db.getDb().prepare(`
     SELECT id, content, category, subcategory, frequency
     FROM nodes ORDER BY frequency DESC LIMIT 5
   `).all() as Array<{ id: string; content: string; category: string; subcategory: string | null; frequency: number }>;
@@ -203,7 +222,8 @@ export function onSessionBeforeCompact(
   if (topNodes.length > 0) {
     lines.push('  Top facts:');
     for (const n of topNodes) {
-      lines.push(`    - [${n.category}${n.subcategory ? '/' + n.subcategory : ''}] ${n.content.slice(0, 120)}`);
+      const label = n.subcategory ? `${n.category}/${n.subcategory}` : n.category;
+      lines.push(`    - [${label}] ${n.content.slice(0, 120)}`);
     }
   }
 
@@ -213,19 +233,26 @@ export function onSessionBeforeCompact(
 }
 
 /**
- * session_shutdown — Save graph state, log snapshot, prune old query log.
+ * session_shutdown — Save graph state, prune query log, close DB (HK-5).
  */
 export function onSessionShutdown(
   db: KnowledgeGraphDB,
   context: SessionShutdownContext,
+  config: KgConfig = DEFAULT_CONFIG,
 ): { snapshotVersion: number; pruned: number } {
-  // Create a snapshot
-  const version = db.createSnapshot(`Session ${context.sessionId} ended`);
+  // Create a session marker
+  const markerId = db.createMarker('session_shutdown', `Session ${context.sessionId} ended`);
 
-  // Prune old query log entries
-  db.pruneQueryLog(1000);
+  // Prune old query log entries using config value (HK-5)
+  const pruned = db.pruneQueryLog(config.queryLogLimit);
 
-  return { snapshotVersion: version, pruned: 0 };
+  // Prune old session markers (DB-6)
+  db.pruneMarkers(50);
+
+  // Close the database connection (HK-5)
+  db.close();
+
+  return { snapshotVersion: markerId, pruned };
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +261,7 @@ export function onSessionShutdown(
 
 /**
  * Format a node as a concise summary line for system prompt injection.
+ * (HK-6: omit null subcategory)
  */
 function formatNodeSummary(node: {
   id: string;
@@ -249,7 +277,7 @@ function formatNodeSummary(node: {
 
 /**
  * Format high-scoring search results as an injection block.
- * Each result gets a line: [category/subcategory] Content (score: X.XX)
+ * (HK-3: provenance-aware, delimited to prevent instruction injection)
  */
 function formatInputSurface(results: SearchHit[]): string {
   const lines = results.map(r => {
@@ -268,25 +296,26 @@ function formatInputSurface(results: SearchHit[]): string {
  * onInput — Fires when user submits input.
  *
  * Searches the knowledge graph for relevant nodes. If any nodes
- * score >= inputSearchThreshold, formats them as an injection block
- * and returns it for system prompt injection.
+ * score >= inputSearchThreshold, formats them as an injection block.
  *
- * Returns null if no results meet the threshold (no injection).
+ * (HK-4: uses configured timeout, non-blocking)
+ * (HK-3: only injects high-trust nodes)
+ * (HK-7: prevents double injection)
  */
 export async function onInput(
   db: KnowledgeGraphDB,
   event: InputContext,
-  config: SearchConfig = DEFAULT_CONFIG,
+  config: KgConfig = DEFAULT_CONFIG,
 ): Promise<string | null> {
   const text = (event.text || '').trim();
   if (!text) return null;
 
-  // Early exit: skip LMStudio call when the graph is empty.
+  // Early exit: skip when graph is empty
   if (db.getNodeCount() === 0) {
     return null;
   }
 
-  // Run hybrid search with input-specific config
+  // Run hybrid search with input-specific timeout (HK-4)
   const results = await searchHybrid(
     db,
     text,
@@ -298,10 +327,28 @@ export async function onInput(
 
   if (results.length === 0) return null;
 
-  // Filter to high-scoring results
-  const highScore = results.filter(r => r.compositeScore >= config.inputSearchThreshold);
+  // Filter to high-scoring, high-trust results (HK-3)
+  const highScore = results.filter(
+    r => r.compositeScore >= config.inputSearchThreshold && r.node.trust === 'high',
+  );
+
   if (highScore.length === 0) return null;
 
+  // Prevent double injection (HK-7)
+  const deduped = highScore.filter(r => !injectedNodeIds.has(r.node.id));
+  if (deduped.length === 0) return null;
+
+  // Track injected IDs
+  deduped.forEach(r => injectedNodeIds.add(r.node.id));
+
   // Format as injection block
-  return formatInputSurface(highScore);
+  return formatInputSurface(deduped);
+}
+
+/**
+ * Clear the per-turn injection tracking.
+ * Call at the start of each new agent turn.
+ */
+export function clearInjectedIds(): void {
+  injectedNodeIds.clear();
 }

@@ -1,9 +1,8 @@
 /**
- * Knowledge Graph — Query Log Management
+ * Knowledge Graph — Query Log Management & Analytics
  *
- * Manages the rolling query log window and provides analytics queries:
- *   logQuery, pruneOldEntries, getMostSurfacedNodes, getZeroResultQueries,
- *   getGraphGrowth, getAgentActionDistribution, getCategoryDistribution
+ * Manages the rolling query log window and provides analytics reports.
+ * All SQL queries are in the db layer (LG-1) — this module only formats.
  */
 
 import type { KnowledgeGraphDB } from './db.ts';
@@ -26,7 +25,7 @@ const DEFAULT_LOGGING_CONFIG: LoggingConfig = {
 
 /**
  * Log a query operation to the query log.
- * This is a convenience wrapper around db.logQuery().
+ * Delegates to db.logQuery() (LG-1: single source of truth).
  */
 export function logQuery(
   db: KnowledgeGraphDB,
@@ -54,48 +53,23 @@ export function pruneOldEntries(
 }
 
 // ---------------------------------------------------------------------------
-// Analytics queries
+// Analytics queries (delegated to db layer — LG-1)
 // ---------------------------------------------------------------------------
 
 /**
  * Most frequently surfaced nodes (by query log hits).
- * Returns the top N nodes that have been returned most often in search results.
+ * Delegates to db.getMostSurfacedNodes().
  */
 export function getMostSurfacedNodes(
   db: KnowledgeGraphDB,
   limit: number = 20,
 ): Array<{ nodeId: string; hits: number }> {
-  // Query the query log for search operations that returned results
-  const rows = db.db.prepare(`
-    SELECT injected_ids, results_returned
-    FROM query_log
-    WHERE query_type = 'search' AND injected_ids IS NOT NULL AND results_returned > 0
-  `).all() as Array<{ injected_ids: string; results_returned: number }>;
-
-  // Parse injected_ids (JSON array) and aggregate hits
-  const nodeHits = new Map<string, number>();
-
-  for (const row of rows) {
-    try {
-      const ids = JSON.parse(row.injected_ids) as string[];
-      const perNodeHits = Math.floor(row.results_returned / Math.max(ids.length, 1));
-      for (const id of ids) {
-        nodeHits.set(id, (nodeHits.get(id) || 0) + perNodeHits);
-      }
-    } catch {
-      // Malformed JSON — skip
-    }
-  }
-
-  return Array.from(nodeHits.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, limit)
-    .map(([nodeId, hits]) => ({ nodeId, hits }));
+  return db.getMostSurfacedNodes(limit);
 }
 
 /**
  * Zero-result queries (gaps in the graph).
- * Returns queries that returned 0 results, indicating missing knowledge.
+ * Delegates to db.getZeroResultQueries().
  */
 export function getZeroResultQueries(
   db: KnowledgeGraphDB,
@@ -105,52 +79,29 @@ export function getZeroResultQueries(
 }
 
 /**
- * Graph growth over time.
- * Returns the number of nodes created per day.
+ * Graph growth over time (LG-3: true cumulative).
+ * Delegates to db.getGraphGrowth().
  */
 export function getGraphGrowth(
   db: KnowledgeGraphDB,
-  dbPath: string,
   limit: number = 30,
 ): Array<{ date: string; nodeCount: number }> {
-  // Get nodes grouped by creation date (created_at is unix ms, convert to seconds)
-  const rows = db.db.prepare(`
-    SELECT DATE(created_at / 1000, 'unixepoch') AS date, COUNT(*) AS nodeCount
-    FROM nodes
-    GROUP BY date
-    ORDER BY date DESC
-    LIMIT ?
-  `).all(limit) as Array<{ date: string; nodeCount: number }>;
-
-  // Calculate cumulative count
-  let cumulative = 0;
-  return rows.reverse().map(row => {
-    cumulative += row.nodeCount;
-    return { date: row.date, nodeCount: cumulative };
-  });
+  return db.getGraphGrowth(limit);
 }
 
 /**
- * Agent action distribution.
- * Returns how many queries were used, ignored, or acted-on.
+ * Agent action distribution (LG-2: aligned field names).
+ * Delegates to db.getAgentActionDistribution().
  */
 export function getAgentActionDistribution(
   db: KnowledgeGraphDB,
 ): Array<{ action: string; count: number }> {
-  const rows = db.db.prepare(`
-    SELECT agent_action, COUNT(*) AS count
-    FROM query_log
-    WHERE agent_action IS NOT NULL
-    GROUP BY agent_action
-    ORDER BY count DESC
-  `).all() as Array<{ action: string; count: number }>;
-
-  return rows;
+  return db.getAgentActionDistribution();
 }
 
 /**
  * Category distribution of nodes.
- * Returns the number of nodes per category/subcategory.
+ * Delegates to db.getCategoryDistribution().
  */
 export function getCategoryDistribution(
   db: KnowledgeGraphDB,
@@ -159,20 +110,13 @@ export function getCategoryDistribution(
 }
 
 /**
- * Query type distribution.
- * Returns the number of operations per type (search, kg_add, kg_link, etc.).
+ * Query type distribution (LG-2: aligned field names).
+ * Delegates to db.getQueryTypeDistribution().
  */
 export function getQueryTypeDistribution(
   db: KnowledgeGraphDB,
 ): Array<{ queryType: string; count: number }> {
-  const rows = db.db.prepare(`
-    SELECT query_type, COUNT(*) AS count
-    FROM query_log
-    GROUP BY query_type
-    ORDER BY count DESC
-  `).all() as Array<{ queryType: string; count: number }>;
-
-  return rows;
+  return db.getQueryTypeDistribution();
 }
 
 // ---------------------------------------------------------------------------
@@ -184,8 +128,8 @@ export interface AnalyticsReport {
   mostSurfaced: Array<{ nodeId: string; hits: number }>;
   gaps: Array<{ query: string; count: number }>;
   distribution: Array<{ category: string; subcategory: string; count: number }>;
-  queryTypeDistribution: Array<{ query_type: string; count: number }>;
-  agentActions: Array<{ agent_action: string; count: number }>;
+  queryTypeDistribution: Array<{ queryType: string; count: number }>;
+  agentActions: Array<{ action: string; count: number }>;
   growth: Array<{ date: string; nodeCount: number }>;
 }
 
@@ -194,7 +138,6 @@ export interface AnalyticsReport {
  */
 export function generateAnalyticsReport(
   db: KnowledgeGraphDB,
-  dbPath: string,
   config: LoggingConfig = DEFAULT_LOGGING_CONFIG,
 ): AnalyticsReport {
   return {
@@ -204,19 +147,67 @@ export function generateAnalyticsReport(
     distribution: getCategoryDistribution(db),
     queryTypeDistribution: getQueryTypeDistribution(db),
     agentActions: getAgentActionDistribution(db),
-    growth: getGraphGrowth(db, dbPath, 30),
+    growth: getGraphGrowth(db, 30),
   };
 }
 
 /**
- * Generate a formatted analytics report string.
+ * Generate a formatted graph overview (for /kg command — LG-4).
+ */
+export function generateGraphOverview(
+  db: KnowledgeGraphDB,
+): string {
+  const stats = db.getGraphStats();
+  const lines: string[] = [];
+
+  lines.push('Knowledge Graph Overview');
+  lines.push('========================');
+  lines.push(`Nodes: ${stats.nodeCount} | Edges: ${stats.edgeCount} | Log entries: ${stats.queryLogSize}`);
+  lines.push('');
+
+  if (stats.oldestNode) {
+    lines.push(`Oldest node: ${stats.oldestNode}`);
+  }
+  if (stats.newestNode) {
+    lines.push(`Newest node: ${stats.newestNode}`);
+  }
+  lines.push('');
+
+  // Category distribution
+  if (stats.categoryDistribution) {
+    lines.push('Categories:');
+    for (const [cat, count] of Object.entries(stats.categoryDistribution)) {
+      lines.push(`  ${cat}: ${count}`);
+    }
+    lines.push('');
+  }
+
+  // Most surfaced nodes
+  const mostSurfaced = db.getMostSurfacedNodes(5);
+  if (mostSurfaced.length > 0) {
+    lines.push('Most Surfaced Nodes:');
+    for (const m of mostSurfaced) {
+      const node = db.getNode(m.nodeId);
+      if (node) {
+        const label = node.subcategory ? `${node.category}/${node.subcategory}` : node.category;
+        lines.push(`  ${m.hits} hits: [${label}] ${node.content.slice(0, 80)}`);
+      }
+    }
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Generate a formatted analytics report (for /kg-query command — LG-4).
  */
 export function generateFormattedReport(
   db: KnowledgeGraphDB,
-  dbPath: string,
+  _dbPath: string = '',
   config: LoggingConfig = DEFAULT_LOGGING_CONFIG,
 ): string {
-  const report = generateAnalyticsReport(db, dbPath, config);
+  const report = generateAnalyticsReport(db, config);
   return formatAnalyticsReport(report, db);
 }
 
@@ -248,7 +239,8 @@ export function formatAnalyticsReport(report: AnalyticsReport, db?: KnowledgeGra
     for (const m of report.mostSurfaced.slice(0, 10)) {
       const node = db.getNode(m.nodeId);
       if (node) {
-        lines.push(`  ${m.hits} hits: [${node.category}${node.subcategory ? '/' + node.subcategory : ''}] ${node.content.slice(0, 80)}`);
+        const label = node.subcategory ? `${node.category}/${node.subcategory}` : node.category;
+        lines.push(`  ${m.hits} hits: [${label}] ${node.content.slice(0, 80)}`);
       }
     }
     lines.push('');
@@ -263,25 +255,25 @@ export function formatAnalyticsReport(report: AnalyticsReport, db?: KnowledgeGra
     lines.push('');
   }
 
-  // Query type distribution
+  // Query type distribution (LG-2: aligned field names — queryType)
   if (report.queryTypeDistribution.length > 0) {
     lines.push('Query Types:');
     for (const q of report.queryTypeDistribution) {
-      lines.push(`  ${q.query_type}: ${q.count}`);
+      lines.push(`  ${q.queryType}: ${q.count}`);
     }
     lines.push('');
   }
 
-  // Agent actions
+  // Agent actions (LG-2: aligned field names — action)
   if (report.agentActions.length > 0) {
     lines.push('Agent Actions:');
     for (const a of report.agentActions) {
-      lines.push(`  ${a.agent_action}: ${a.count}`);
+      lines.push(`  ${a.action}: ${a.count}`);
     }
     lines.push('');
   }
 
-  // Growth (last 7 days)
+  // Growth (last 7 days) (LG-3: true cumulative)
   const recentGrowth = report.growth.slice(-7);
   if (recentGrowth.length > 0) {
     lines.push('Recent Growth (last 7 days):');

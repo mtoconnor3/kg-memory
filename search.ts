@@ -5,36 +5,59 @@
  * and ranking with configurable weights.
  */
 
-import type { KnowledgeGraphDB, SearchHit } from './db.ts';
+import type { KnowledgeGraphDB, SearchHit, KnowledgeNode } from './db.ts';
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
-export interface SearchConfig {
+export interface KgConfig {
+  // Database
+  graphPath: string;
+
+  // Embedding
   embeddingEndpoint: string;
   embeddingModel: string;
+
+  // Search
   maxResults: number;
-  ftxF5Weight: number;
+
+  // Ranking weights (must sum to ~1.0)
+  ftsF5Weight: number;
   vectorWeight: number;
   frequencyWeight: number;
+  freshnessWeight: number;
 
   // Input hook config
   inputSearchThreshold: number;
   inputSearchMaxResults: number;
   inputSearchTimeout: number;
+
+  // Injection
+  injectionBudget: number;
+
+  // Query log
+  queryLogLimit: number;
+
+  // Staleness
+  staleNodeDays: number;
 }
 
-export const DEFAULT_CONFIG: SearchConfig = {
-  embeddingEndpoint: 'http://192.168.1.1:1234/v1/embeddings',
+export const DEFAULT_CONFIG: KgConfig = {
+  graphPath: '',
+  embeddingEndpoint: 'http://192.268.1.1:1234/v1/embeddings',
   embeddingModel: 'nomic-embed-text-v1.5',
   maxResults: 10,
-  ftxF5Weight: 0.4,
-  vectorWeight: 0.5,
-  frequencyWeight: 0.1,
+  ftsF5Weight: 0.4,
+  vectorWeight: 0.3,
+  frequencyWeight: 0.15,
+  freshnessWeight: 0.15,
   inputSearchThreshold: 0.45,
   inputSearchMaxResults: 3,
   inputSearchTimeout: 2000,
+  injectionBudget: 2000,
+  queryLogLimit: 1000,
+  staleNodeDays: 90,
 };
 
 // ---------------------------------------------------------------------------
@@ -42,13 +65,53 @@ export const DEFAULT_CONFIG: SearchConfig = {
 // ---------------------------------------------------------------------------
 
 /**
- * Call LMStudio to generate an embedding for text.
- * Returns the raw float array (768 dims for nomic-embed-text).
+ * Call LMStudio to generate embeddings for text.
+ * Supports batch input (array of strings) for efficiency (SR-1).
+ * Applies nomic task prefixes (SR-4).
  */
 export async function getEmbedding(
-  db: KnowledgeGraphDB,
-  text: string,
-  config: SearchConfig = DEFAULT_CONFIG,
+  text: string | string[],
+  config: KgConfig = DEFAULT_CONFIG,
+  timeoutMs: number = 10000,
+): Promise<number[] | null> {
+  try {
+    // Apply nomic task prefix (SR-4)
+    const input = Array.isArray(text) ? text : [text];
+    const prefixed = input.map(t => `search_document: ${t}`);
+
+    const response = await fetch(config.embeddingEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: config.embeddingModel,
+        input: prefixed,
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (!response.ok) {
+      console.warn(`[kg-memory] Embedding API returned ${response.status}: ${response.statusText}`);
+      return null;
+    }
+
+    const data = await response.json() as { data: Array<{ embedding: number[] }> };
+    if (!Array.isArray(data.data) || data.data.length === 0) return null;
+
+    // Return first embedding for single-text calls, or first for batch
+    return data.data[0]?.embedding ?? null;
+  } catch (err) {
+    console.warn('[kg-memory] Embedding API unavailable:', (err as Error).message);
+    return null;
+  }
+}
+
+/**
+ * Get embedding for a search query (with search_query: prefix).
+ */
+export async function getQueryEmbedding(
+  query: string,
+  config: KgConfig = DEFAULT_CONFIG,
+  timeoutMs: number = 10000,
 ): Promise<number[] | null> {
   try {
     const response = await fetch(config.embeddingEndpoint, {
@@ -56,9 +119,9 @@ export async function getEmbedding(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: config.embeddingModel,
-        input: text,
+        input: `search_query: ${query}`,
       }),
-      signal: AbortSignal.timeout(10000), // 10s timeout
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
     if (!response.ok) {
@@ -75,42 +138,42 @@ export async function getEmbedding(
 }
 
 /**
- * Store an embedding for a node (lazy: generated on demand).
+ * Batch-embed multiple texts at once (SR-1).
+ * Returns array of embeddings (null for any that failed).
  */
-export async function storeEmbedding(
-  db: KnowledgeGraphDB,
-  nodeId: string,
-  embedding: number[],
-): Promise<void> {
-  // Convert float array to binary blob for SQLite
-  const buffer = Buffer.from(new Float32Array(embedding).buffer);
+export async function batchEmbed(
+  texts: string[],
+  config: KgConfig = DEFAULT_CONFIG,
+  timeoutMs: number = 10000,
+): Promise<Array<number[] | null>> {
+  if (texts.length === 0) return [];
 
   try {
-    db.db.prepare('INSERT OR REPLACE INTO node_vectors (node_id, embedding) VALUES (?, ?)').run(
-      nodeId,
-      buffer,
-    );
+    // Apply nomic task prefix (SR-4)
+    const prefixed = texts.map(t => `search_document: ${t}`);
+
+    const response = await fetch(config.embeddingEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: config.embeddingModel,
+        input: prefixed,
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (!response.ok) {
+      console.warn(`[kg-memory] Batch embedding API returned ${response.status}`);
+      return texts.map(() => null);
+    }
+
+    const data = await response.json() as { data: Array<{ embedding: number[] }> };
+    if (!Array.isArray(data.data)) return texts.map(() => null);
+
+    return data.data.map(d => d.embedding ?? null);
   } catch (err) {
-    console.warn('[kg-memory] Failed to store embedding:', (err as Error).message);
-  }
-}
-
-/**
- * Retrieve a stored embedding for a node.
- */
-export function getStoredEmbedding(db: KnowledgeGraphDB, nodeId: string): number[] | null {
-  try {
-    const row = db.db.prepare(
-      'SELECT embedding FROM node_vectors WHERE node_id = ?',
-    ).get(nodeId) as { embedding: Buffer } | undefined;
-
-    if (!row) return null;
-
-    // Convert BLOB back to float array
-    const floatArray = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
-    return Array.from(floatArray);
-  } catch {
-    return null;
+    console.warn('[kg-memory] Batch embedding failed:', (err as Error).message);
+    return texts.map(() => null);
   }
 }
 
@@ -119,16 +182,14 @@ export function getStoredEmbedding(db: KnowledgeGraphDB, nodeId: string): number
 // ---------------------------------------------------------------------------
 
 /**
- * Compute cosine distance between two vectors.
- * For nomic-embed-text (general embeddings with signed values),
- * the result is in [0, 2]:
- *   0 = identical (same direction)
- *   1 = orthogonal (unrelated)
- *   2 = exactly opposite
+ * Compute cosine similarity between two vectors (SR-7: raw similarity, not distance).
+ * Returns value in [0, 1] where 1 = identical, 0 = orthogonal or worse.
+ * Handles dimension mismatch gracefully (SR-2: fail soft, not throw).
  */
-export function cosineDistance(a: number[], b: number[]): number {
+export function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length) {
-    throw new Error(`Vector dimension mismatch: ${a.length} vs ${b.length}`);
+    // Dimension mismatch — return 0 (no similarity) instead of throwing (SR-2)
+    return 0;
   }
 
   let dotProduct = 0;
@@ -138,29 +199,82 @@ export function cosineDistance(a: number[], b: number[]): number {
   for (let i = 0; i < a.length; i++) {
     dotProduct += a[i] * b[i];
     normA += a[i] * a[i];
-    normB += b[i] * b[i];
+    normB += a[i] * a[i];
   }
 
   const magnitude = Math.sqrt(normA) * Math.sqrt(normB);
-  if (magnitude === 0) return 1.0; // undefined direction
+  if (magnitude === 0) return 0; // undefined direction → no similarity
 
   // Cosine similarity: dot / (|a| * |b|), ranges [-1, 1]
   const cosineSim = dotProduct / magnitude;
 
-  // Cosine distance: 1 - cosine_similarity, ranges [0, 2] for signed embeddings
-  //   -1 (opposite) → distance 2
-  //    0 (orthogonal) → distance 1
-  //   +1 (identical) → distance 0
-  return 1.0 - cosineSim;
+  // Clamp to [0, 1] — negative similarity treated as 0 (SR-7)
+  return Math.max(0, Math.min(1, cosineSim));
+}
+
+// ---------------------------------------------------------------------------
+// Unified scoring (SR-3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute composite score for a search hit using unified formula.
+ * Weights: { ftsF5Weight, vectorWeight, frequencyWeight, freshnessWeight }
+ * When vector is unavailable, its weight is redistributed to BM25.
+ */
+export function computeCompositeScore(
+  bm25Score: number,
+  vectorScore: number | null,
+  frequencyBoost: number,
+  freshnessScore: number,
+  config: KgConfig,
+): number {
+  const w = config;
+  if (vectorScore !== null) {
+    // Full hybrid scoring — all four terms
+    return (
+      (bm25Score * w.ftsF5Weight) +
+      (vectorScore * w.vectorWeight) +
+      (frequencyBoost * w.frequencyWeight) +
+      (freshnessScore * w.freshnessWeight)
+    );
+  } else {
+    // No vector — redistribute vectorWeight to BM25 proportionally
+    const noVectorTotal = w.ftsF5Weight + w.vectorWeight;
+    const bm25Share = noVectorTotal > 0 ? w.ftsF5Weight / noVectorTotal : 0;
+    return (
+      (bm25Score * noVectorTotal * bm25Share / w.ftsF5Weight) +
+      (frequencyBoost * w.frequencyWeight) +
+      (freshnessScore * w.freshnessWeight)
+    );
+  }
 }
 
 /**
- * Normalize cosine distance to [0, 1] for combining with BM25.
- * Since lower distance = more similar, and BM25 is also lower = more similar,
- * we normalize by dividing by 2.0 (the max distance for signed embeddings).
+ * Log-normalized frequency boost (DB-5: uses access_count).
  */
-export function normalizeCosineDistance(distance: number): number {
-  return Math.max(0, Math.min(1, distance / 2.0));
+function computeFrequencyBoost(
+  frequency: number,
+  accessCount: number,
+  maxFreq: number,
+  maxAccess: number,
+): number {
+  // Blend frequency (write count) and access_count (read count)
+  const freqScore = maxFreq > 1
+    ? Math.min(Math.log(frequency + 1) / Math.log(maxFreq + 1), 1.0)
+    : 0;
+  const accessScore = maxAccess > 1
+    ? Math.min(Math.log(accessCount + 1) / Math.log(maxAccess + 1), 1.0)
+    : 0;
+  // Weight access slightly more — it reflects actual retrieval usefulness
+  return 0.4 * freqScore + 0.6 * accessScore;
+}
+
+/**
+ * Exponential decay freshness score (30-day half-life).
+ */
+function computeFreshnessScore(lastAccessedAt: number, now: number): number {
+  const hoursSinceAccessed = (now - lastAccessedAt) / (1000 * 60 * 60);
+  return 1.0 / (1.0 + hoursSinceAccessed / 720);
 }
 
 // ---------------------------------------------------------------------------
@@ -168,30 +282,12 @@ export function normalizeCosineDistance(distance: number): number {
 // ---------------------------------------------------------------------------
 
 /**
- * Get all nodes from the database, optionally filtered by category/subcategory.
- * Used as fallback candidate set when FTS5 returns 0 results.
- */
-export function getFilteredNodes(
-  db: KnowledgeGraphDB,
-  categories?: string[],
-  subcategories?: string[],
-): KnowledgeNode[] {
-  return db.getAllNodes(categories, subcategories);
-}
-
-/**
- * Get the maximum frequency across all nodes (for normalization).
- */
-export function getMaxFrequency(db: KnowledgeGraphDB): number {
-  return db.getMaxFrequency();
-}
-
-/**
- * Hybrid search: FTS5 + vector cosine distance.
+ * Hybrid search: FTS5 + vector cosine similarity.
  *
- * When FTS5 returns results, scores them by BM25 + vector distance.
- * When FTS5 returns 0, scores ALL nodes by vector similarity (no early exit).
- * When LMStudio is unavailable, falls back to pure FTS5 (may return 0).
+ * - FTS5 provides BM25 candidate set
+ * - Vector similarity refines ranking when LMStudio is available
+ * - On FTS miss, falls back to capped candidate set (SR-1)
+ * - Unified scoring across all paths (SR-3)
  */
 export async function searchHybrid(
   db: KnowledgeGraphDB,
@@ -199,97 +295,125 @@ export async function searchHybrid(
   maxResults: number = 10,
   categories?: string[],
   subcategories?: string[],
-  config: SearchConfig = DEFAULT_CONFIG,
+  config: KgConfig = DEFAULT_CONFIG,
 ): Promise<SearchHit[]> {
-  // Phase 0: Early exit — no nodes, no point calling LMStudio.
-  // This prevents KV cache churn from embedding requests when the graph is empty.
+  // Phase 0: Early exit — no nodes
   const nodeCount = db.getNodeCount();
   if (nodeCount === 0) {
     return [];
   }
 
-  // Phase 1: Get FTS5 candidate set (may be empty)
+  const trimmedQuery = (query || '').trim();
+  const now = Date.now();
+  const maxFreq = db.getMaxFrequency();
+  const maxAccess = db.getMaxAccessCount();
+
+  // Phase 1: Get FTS5 candidate set
   const ftsResults = db.searchFTS5(query, maxResults * 3, categories, subcategories);
 
-  // Phase 2: Always try vector search (even if FTS5 returned 0)
-  const queryEmbedding = await getEmbedding(db, query, config);
+  // Phase 2: Try vector search
+  const vectorTimeout = trimmedQuery.length < 50 ? config.inputSearchTimeout : 10000;
+  const queryEmbedding = await getQueryEmbedding(query, config, vectorTimeout);
 
   if (!queryEmbedding) {
-    // LMStudio unavailable — return pure FTS5 (may be 0)
+    // LMStudio unavailable — return FTS5 results with unified scoring (SR-3)
     console.warn('[kg-memory] Embedding unavailable, falling back to pure FTS5');
-    return ftsResults.slice(0, maxResults);
+    return ftsResults
+      .map(hit => ({
+        ...hit,
+        compositeScore: computeCompositeScore(
+          hit.bm25Score,
+          null,
+          computeFrequencyBoost(hit.node.frequency, hit.node.accessCount, maxFreq, maxAccess),
+          hit.freshnessScore,
+          config,
+        ),
+      }))
+      .sort((a, b) => b.compositeScore - a.compositeScore)
+      .slice(0, maxResults);
   }
 
-  // Candidate set: use FTS5 results if available, otherwise ALL nodes
-  // This ensures we always have nodes to score by vector similarity
-  const candidateNodes = getFilteredNodes(db, categories, subcategories);
-  const candidates = ftsResults.length > 0
-    ? ftsResults
-    : candidateNodes.map(node => ({
-        node,
-        bm25Score: 0,
-        vectorScore: null,
-        frequencyBoost: 0,
-        freshnessScore: 0,
-        compositeScore: 0,
-        edges: db.getNodeEdges(node.id),
-      }));
+  // Phase 3: Score candidates by vector similarity
+  // If FTS returned results, use them as candidates
+  // If FTS returned 0, use a capped fallback set (SR-1)
+  let candidates: SearchHit[] = ftsResults;
+  if (candidates.length === 0) {
+    // Cap fallback to 50 nodes, sorted by recency/frequency (SR-1)
+    const fallbackNodes = db.getFallbackCandidates(50, categories, subcategories);
+    candidates = fallbackNodes.map(node => ({
+      node,
+      bm25Score: 0,
+      vectorScore: null,
+      frequencyBoost: 0,
+      freshnessScore: 0,
+      compositeScore: 0,
+      edges: db.getNodeEdges(node.id),
+    }));
+  }
 
-  // Phase 3: Score each candidate by vector distance
+  // Batch-embed unembedded nodes (SR-1)
+  const unembeddedNodes = candidates
+    .filter(hit => hit.vectorScore === null)
+    .map(hit => hit.node);
+
+  if (unembeddedNodes.length > 0) {
+    const contents = unembeddedNodes.map(n => n.content);
+    const embeddings = await batchEmbed(contents, config, vectorTimeout);
+
+    for (let i = 0; i < unembeddedNodes.length; i++) {
+      const node = unembeddedNodes[i];
+      const embedding = embeddings[i];
+      if (embedding) {
+        // Store with model/dim stamp (SR-2)
+        db.storeVector(node.id, embedding, config.embeddingModel);
+      }
+    }
+  }
+
+  // Score each candidate
   const scoredResults: SearchHit[] = [];
-  const maxFreq = getMaxFrequency(db);
-  const now = Date.now();
-
   for (const candidate of candidates) {
     const { node } = candidate;
 
-    // Get or generate the node's embedding
-    let nodeEmbedding = getStoredEmbedding(db, node.id);
+    // Get stored embedding (check model/dim match — SR-2)
+    const vectorData = db.getVector(node.id);
+    let vectorScore: number | null = null;
 
-    if (!nodeEmbedding) {
-      // Lazy-embed: generate and store embedding for this node
-      nodeEmbedding = await getEmbedding(db, node.content, config);
-      if (nodeEmbedding) {
-        await storeEmbedding(db, node.id, nodeEmbedding);
+    if (vectorData) {
+      if (vectorData.model === config.embeddingModel && vectorData.dim === queryEmbedding.length) {
+        // Dimensions match — compute similarity
+        try {
+          vectorScore = cosineSimilarity(queryEmbedding, vectorData.embedding);
+        } catch {
+          // Fail soft — skip vector for this node (SR-2)
+          vectorScore = null;
+        }
+      } else {
+        // Model or dim mismatch — skip, will be re-embedded on next write (SR-2)
+        vectorScore = null;
       }
     }
 
-    if (!nodeEmbedding) {
-      // Could not generate embedding — skip this node
-      continue;
-    }
+    // Compute all scores using unified formula (SR-3)
+    const frequencyBoost = computeFrequencyBoost(node.frequency, node.accessCount, maxFreq, maxAccess);
+    const freshnessScore = computeFreshnessScore(node.lastAccessedAt, now);
 
-    const distance = cosineDistance(queryEmbedding, nodeEmbedding);
-    // Invert: distance → similarity (higher = more relevant)
-    const normalizedDistance = normalizeCosineDistance(distance);
-    const vectorScore = 1.0 - normalizedDistance;
-
-    // Compute BM25 score (0 if no FTS match)
-    const bm25Score = (candidate as SearchHit).bm25Score ?? 0;
-
-    // Compute frequency boost
-    const frequencyBoost = maxFreq > 1
-      ? Math.min(Math.log(node.frequency + 1) / Math.log(maxFreq + 1), 1.0)
-      : 0;
-
-    // Compute freshness
-    const hoursSinceAccessed = (now - node.lastAccessedAt) / (1000 * 60 * 60);
-    const freshness = 1.0 / (1.0 + hoursSinceAccessed / 720);
-
-    // Composite score: BM25 + vector + frequency
-    const compositeScore =
-      (bm25Score * config.ftxF5Weight) +
-      (vectorScore * config.vectorWeight) +
-      (frequencyBoost * config.frequencyWeight);
+    const compositeScore = computeCompositeScore(
+      candidate.bm25Score,
+      vectorScore,
+      frequencyBoost,
+      freshnessScore,
+      config,
+    );
 
     scoredResults.push({
       node,
-      bm25Score,
+      bm25Score: candidate.bm25Score,
       vectorScore,
       frequencyBoost,
-      freshnessScore: freshness,
+      freshnessScore,
       compositeScore,
-      edges: db.getNodeEdges(node.id),
+      edges: candidate.edges,
     });
   }
 
@@ -299,40 +423,47 @@ export async function searchHybrid(
 }
 
 // ---------------------------------------------------------------------------
-// Ranking helpers
+// Config validation (per-field, not all-or-nothing — CFG-2)
 // ---------------------------------------------------------------------------
 
 /**
- * Log-normalized frequency boost.
- * Prevents high-frequency nodes from dominating.
+ * Validate and merge config with defaults.
+ * Each field is validated independently — a bad weight doesn't discard other values (CFG-2).
  */
-export function frequencyBoost(frequency: number, maxFrequency: number): number {
-  if (maxFrequency <= 1) return 0;
-  return Math.min(Math.log(frequency + 1) / Math.log(maxFrequency + 1), 1.0);
-}
-
-/**
- * Exponential decay freshness score.
- * 30-day half-life: nodes not accessed in 30 days get half score.
- */
-export function freshnessScore(lastAccessedAt: number, now: number): number {
-  const hoursSinceAccessed = (now - lastAccessedAt) / (1000 * 60 * 60);
-  return 1.0 / (1.0 + hoursSinceAccessed / 720); // 30 days = 720 hours
-}
-
-/**
- * Validate search configuration weights sum to ~1.0.
- */
-export function validateConfig(config: Partial<SearchConfig>): SearchConfig {
+export function validateConfig(config: Partial<KgConfig>): KgConfig {
   const merged = { ...DEFAULT_CONFIG, ...config };
 
-  const total = merged.ftxF5Weight + merged.vectorWeight + merged.frequencyWeight;
-  if (Math.abs(total - 1.0) > 0.01) {
-    console.warn(`[kg-memory] Search weights sum to ${total.toFixed(3)}, expected 1.0. Using defaults.`);
-    return { ...DEFAULT_CONFIG };
+  // Support deprecated ftxF5Weight key (CFG-1)
+  if ('ftxF5Weight' in config && !('ftsF5Weight' in config)) {
+    merged.ftsF5Weight = (config as any).ftxF5Weight;
+    console.warn('[kg-memory] Deprecated key "ftxF5Weight" — use "ftsF5Weight" instead');
   }
 
-  // Validate endpoint is a URL
+  // Validate and clamp weights independently (CFG-2)
+  if (typeof merged.ftsF5Weight !== 'number' || merged.ftsF5Weight < 0 || merged.ftsF5Weight > 1) {
+    console.warn(`[kg-memory] Invalid ftsF5Weight. Using default ${DEFAULT_CONFIG.ftsF5Weight}.`);
+    merged.ftsF5Weight = DEFAULT_CONFIG.ftsF5Weight;
+  }
+  if (typeof merged.vectorWeight !== 'number' || merged.vectorWeight < 0 || merged.vectorWeight > 1) {
+    console.warn(`[kg-memory] Invalid vectorWeight. Using default ${DEFAULT_CONFIG.vectorWeight}.`);
+    merged.vectorWeight = DEFAULT_CONFIG.vectorWeight;
+  }
+  if (typeof merged.frequencyWeight !== 'number' || merged.frequencyWeight < 0 || merged.frequencyWeight > 1) {
+    console.warn(`[kg-memory] Invalid frequencyWeight. Using default ${DEFAULT_CONFIG.frequencyWeight}.`);
+    merged.frequencyWeight = DEFAULT_CONFIG.frequencyWeight;
+  }
+  if (typeof merged.freshnessWeight !== 'number' || merged.freshnessWeight < 0 || merged.freshnessWeight > 1) {
+    console.warn(`[kg-memory] Invalid freshnessWeight. Using default ${DEFAULT_CONFIG.freshnessWeight}.`);
+    merged.freshnessWeight = DEFAULT_CONFIG.freshnessWeight;
+  }
+
+  // Warn if weights don't sum to ~1.0 (but don't discard other config)
+  const total = merged.ftsF5Weight + merged.vectorWeight + merged.frequencyWeight + merged.freshnessWeight;
+  if (Math.abs(total - 1.0) > 0.01) {
+    console.warn(`[kg-memory] Search weights sum to ${total.toFixed(3)}, expected 1.0. Scores may be off.`);
+  }
+
+  // Validate endpoint
   try {
     new URL(merged.embeddingEndpoint);
   } catch {
@@ -340,22 +471,40 @@ export function validateConfig(config: Partial<SearchConfig>): SearchConfig {
     merged.embeddingEndpoint = DEFAULT_CONFIG.embeddingEndpoint;
   }
 
-  // Validate inputSearchThreshold (0–1)
+  // Validate inputSearchThreshold (CFG-4: correct default)
   if (typeof merged.inputSearchThreshold !== 'number' || merged.inputSearchThreshold < 0 || merged.inputSearchThreshold > 1) {
-    console.warn(`[kg-memory] Invalid inputSearchThreshold. Using default 0.65.`);
+    console.warn(`[kg-memory] Invalid inputSearchThreshold. Using default ${DEFAULT_CONFIG.inputSearchThreshold}.`);
     merged.inputSearchThreshold = DEFAULT_CONFIG.inputSearchThreshold;
   }
 
-  // Validate inputSearchMaxResults (positive integer)
+  // Validate inputSearchMaxResults
   if (!Number.isInteger(merged.inputSearchMaxResults) || merged.inputSearchMaxResults < 1) {
-    console.warn(`[kg-memory] Invalid inputSearchMaxResults. Using default 3.`);
+    console.warn(`[kg-memory] Invalid inputSearchMaxResults. Using default ${DEFAULT_CONFIG.inputSearchMaxResults}.`);
     merged.inputSearchMaxResults = DEFAULT_CONFIG.inputSearchMaxResults;
   }
 
-  // Validate inputSearchTimeout (positive number)
+  // Validate inputSearchTimeout (CFG-5: now threaded through)
   if (typeof merged.inputSearchTimeout !== 'number' || merged.inputSearchTimeout <= 0) {
-    console.warn(`[kg-memory] Invalid inputSearchTimeout. Using default 2000.`);
+    console.warn(`[kg-memory] Invalid inputSearchTimeout. Using default ${DEFAULT_CONFIG.inputSearchTimeout}.`);
     merged.inputSearchTimeout = DEFAULT_CONFIG.inputSearchTimeout;
+  }
+
+  // Validate injectionBudget (TS-3, CFG-2)
+  if (typeof merged.injectionBudget !== 'number' || merged.injectionBudget <= 0) {
+    console.warn(`[kg-memory] Invalid injectionBudget. Using default ${DEFAULT_CONFIG.injectionBudget}.`);
+    merged.injectionBudget = DEFAULT_CONFIG.injectionBudget;
+  }
+
+  // Validate queryLogLimit
+  if (typeof merged.queryLogLimit !== 'number' || merged.queryLogLimit < 10) {
+    console.warn(`[kg-memory] Invalid queryLogLimit. Using default ${DEFAULT_CONFIG.queryLogLimit}.`);
+    merged.queryLogLimit = DEFAULT_CONFIG.queryLogLimit;
+  }
+
+  // Validate staleNodeDays (CFG-6)
+  if (typeof merged.staleNodeDays !== 'number' || merged.staleNodeDays < 1) {
+    console.warn(`[kg-memory] Invalid staleNodeDays. Using default ${DEFAULT_CONFIG.staleNodeDays}.`);
+    merged.staleNodeDays = DEFAULT_CONFIG.staleNodeDays;
   }
 
   return merged;

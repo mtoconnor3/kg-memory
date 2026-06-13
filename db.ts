@@ -1,7 +1,7 @@
 /**
  * Knowledge Graph — Database Layer
  *
- * SQLite database with FTS5 and sqlite-vec support.
+ * SQLite database with FTS5 support.
  * Handles schema creation, CRUD operations, and graph analytics.
  */
 
@@ -22,8 +22,11 @@ CREATE TABLE IF NOT EXISTS nodes (
   subcategory   TEXT,
   content       TEXT NOT NULL,
   properties    TEXT,
+  source        TEXT DEFAULT 'agent',
+  trust         TEXT DEFAULT 'high',
   created_at    REAL,
   last_accessed REAL,
+  access_count  INTEGER DEFAULT 0,
   frequency     INTEGER DEFAULT 0,
   content_hash  TEXT
 );
@@ -35,7 +38,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts
 -- Vector embeddings (populated when LMStudio embedding API is available)
 CREATE TABLE IF NOT EXISTS node_vectors (
   node_id   TEXT PRIMARY KEY REFERENCES nodes(id),
-  embedding BLOB
+  embedding BLOB,
+  model     TEXT,
+  dim       INTEGER
 );
 
 -- Relationships between nodes (edge types normalized)
@@ -61,10 +66,11 @@ CREATE TABLE IF NOT EXISTS query_log (
   agent_action    TEXT
 );
 
--- Graph snapshots for versioning/time-travel
-CREATE TABLE IF NOT EXISTS graph_snapshots (
-  version     INTEGER PRIMARY KEY,
+-- Session markers (replaces graph_snapshots)
+CREATE TABLE IF NOT EXISTS session_markers (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
   timestamp   TEXT,
+  event       TEXT,
   node_count  INTEGER,
   edge_count  INTEGER,
   summary     TEXT
@@ -96,8 +102,11 @@ export interface KnowledgeNode {
   subcategory: string | null;
   content: string;
   properties: Record<string, string> | null;
+  source: string;
+  trust: string;
   createdAt: number;
   lastAccessedAt: number;
+  accessCount: number;
   frequency: number;
   contentHash: string;
 }
@@ -127,22 +136,17 @@ export interface SearchHit {
 export class KnowledgeGraphDB {
   private db: Database.Database;
   private dbPath: string;
-  private vecLoaded: boolean;
 
   constructor(dbPath: string) {
     this.dbPath = dbPath;
-    this.vecLoaded = false;
 
     // Ensure directory exists
     const dir = path.dirname(dbPath);
     fs.mkdirSync(dir, { recursive: true });
 
-    // Open (or create) the database
+    // Open (or create) the database — WAL set via pragma, not constructor
     this.db = new Database(dbPath, {
-      wal: true,
-      journalMode: 'wal',
       timeout: 5000,
-      readonly: false,
     });
 
     // Configure SQLite pragmas
@@ -151,23 +155,87 @@ export class KnowledgeGraphDB {
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('cache_size = -64000'); // 64MB
 
-    // Note: sqlite-vec extension is not needed for the current vector pipeline.
-    // search.ts performs all embedding operations (generation, storage, cosine distance)
-    // in pure JavaScript. sqlite-vec would only be needed for SQL-based vector queries.
-    this.vecLoaded = false;
-
     // Execute schema
     this.db.exec(SCHEMA_SQL);
 
+    // Run migrations (add columns if they don't exist)
+    this.migrate();
+
     // Initialize FTS5 if nodes table exists
+    this.initFts();
+  }
+
+  // -----------------------------------------------------------------------
+  // Migrations
+  // -----------------------------------------------------------------------
+
+  private migrate(): void {
+    // Add 'source' and 'trust' columns if they don't exist (HK-3 provenance)
+    try {
+      this.db.pragma('table_info(nodes)');
+      const columns = this.db.pragma('table_info(nodes)') as Array<{ name: string }>;
+      const colNames = columns.map(c => c.name);
+
+      if (!colNames.includes('source')) {
+        this.db.exec('ALTER TABLE nodes ADD COLUMN source TEXT DEFAULT \'agent\'');
+      }
+      if (!colNames.includes('trust')) {
+        this.db.exec('ALTER TABLE nodes ADD COLUMN trust TEXT DEFAULT \'high\'');
+      }
+      if (!colNames.includes('access_count')) {
+        this.db.exec('ALTER TABLE nodes ADD COLUMN access_count INTEGER DEFAULT 0');
+        this.db.exec('CREATE INDEX IF NOT EXISTS idx_nodes_access_count ON nodes(access_count)');
+      }
+    } catch {
+      // Table might not exist yet — that's fine, schema will create it
+    }
+
+    // Add 'model' and 'dim' columns to node_vectors if they don't exist (SR-2)
+    try {
+      const vecColumns = this.db.pragma('table_info(node_vectors)') as Array<{ name: string }>;
+      const vecColNames = vecColumns.map(c => c.name);
+
+      if (!vecColNames.includes('model')) {
+        this.db.exec('ALTER TABLE node_vectors ADD COLUMN model TEXT');
+        // Backfill existing vectors with known model
+        this.db.prepare('UPDATE node_vectors SET model = \'nomic-embed-text-v1.5\', dim = 768 WHERE model IS NULL').run();
+      }
+      if (!vecColNames.includes('dim')) {
+        this.db.exec('ALTER TABLE node_vectors ADD COLUMN dim INTEGER');
+        this.db.prepare('UPDATE node_vectors SET dim = 768 WHERE dim IS NULL').run();
+      }
+    } catch {
+      // Table might not exist yet
+    }
+
+    // Rename graph_snapshots to session_markers if old table exists (DB-6)
+    try {
+      const hasSnapshots = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='graph_snapshots'").get() as { name: string } | undefined;
+      if (hasSnapshots) {
+        // Migrate data to new table
+        this.db.exec(`
+          INSERT OR IGNORE INTO session_markers (timestamp, event, node_count, edge_count, summary)
+          SELECT timestamp, 'snapshot', node_count, edge_count, summary FROM graph_snapshots
+        `);
+        this.db.exec('DROP TABLE graph_snapshots');
+      }
+    } catch {
+      // Either table doesn't exist or migration already ran
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // FTS initialization
+  // -----------------------------------------------------------------------
+
+  private initFts(): void {
     try {
       const hasFts = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='nodes_fts'").get() as { name: string } | undefined;
       if (hasFts) {
-        // Rebuild FTS index from existing nodes (only if there are nodes)
+        // Rebuild FTS index from existing nodes using the correct external-content idiom
         const nodeCount = (this.db.prepare('SELECT COUNT(*) AS cnt FROM nodes').get() as { cnt: number }).cnt;
         if (nodeCount > 0) {
-          this.db.prepare('INSERT OR IGNORE INTO nodes_fts SELECT * FROM nodes').run();
-          this.db.prepare('fts5_rebuild(nodes_fts)').run();
+          this.db.prepare("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')").run();
         }
       }
     } catch {
@@ -177,56 +245,69 @@ export class KnowledgeGraphDB {
   }
 
   // -----------------------------------------------------------------------
+  // Public DB accessor (for modules that need direct SQL — interim fix for TS-2)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Get the raw Database handle. Use sparingly — prefer typed methods above.
+   * @deprecated Use typed methods instead; this exists for backward compatibility.
+   */
+  public getDb(): Database.Database {
+    return this.db;
+  }
+
+  // -----------------------------------------------------------------------
   // Node CRUD
   // -----------------------------------------------------------------------
 
   /**
-   * Get a node by its ID. Updates last_accessed and frequency.
+   * Get a node by its ID. Updates last_accessed and access_count.
    */
   getNode(id: string): KnowledgeNode | null {
     const row = this.db.prepare(`
       SELECT id, category, subcategory, content, properties,
-             created_at, last_accessed, frequency, content_hash
+             source, trust, created_at, last_accessed, access_count, frequency, content_hash
       FROM nodes WHERE id = ?
     `).get(id) as Record<string, any> | undefined;
 
     if (!row) return null;
 
+    // Update access tracking (DB-3)
+    const now = Date.now();
+    this.db.prepare(`
+      UPDATE nodes SET last_accessed = ?, access_count = access_count + 1 WHERE id = ?
+    `).run(now, id);
+
     return this._rowToNode(row);
   }
 
   /**
-   * Get a node by its content hash (for dedup).
-   */
-  getNodeByContentHash(contentHash: string): KnowledgeNode[] {
-    const rows = this.db.prepare(`
-      SELECT id, category, subcategory, content, properties,
-             created_at, last_accessed, frequency, content_hash
-      FROM nodes WHERE content_hash = ?
-    `).all(contentHash) as Record<string, any>[];
-
-    return rows.map(r => this._rowToNode(r));
-  }
-
-  /**
    * Save (insert or update) a node.
-   * If a node with the same content_hash exists, update it instead.
+   * Identity is (category, subcategory, content) — no category mutation on dedup.
+   * Only category, subcategory, content, and properties are required; the rest are auto-filled.
    */
-  saveNode(node: Omit<KnowledgeNode, 'id'> & { id?: string }): { id: string; created: boolean } {
+  saveNode(node: {
+    category: string;
+    subcategory?: string | null;
+    content: string;
+    properties?: Record<string, string> | null;
+    source?: string;
+    trust?: string;
+  }): { id: string; created: boolean } {
     const now = Date.now();
     const contentHash = createHash('sha256').update(node.content).digest('hex');
 
     const propertiesStr = node.properties ? JSON.stringify(node.properties) : null;
 
-    // Check for dedup by content_hash
-    const existing = this.db.prepare(`
-      SELECT id, category, subcategory, frequency, last_accessed
-      FROM nodes WHERE content_hash = ?
-    `).get(contentHash) as Record<string, any> | undefined;
-
-    // Generate deterministic ID from category + subcategory + content
+    // Generate deterministic ID from category + subcategory + content (DB-4)
     const key = `${node.category}:${node.subcategory || ''}:${node.content}`;
     const nodeId = `node_${createHash('sha256').update(key).digest('hex').slice(0, 16)}`;
+
+    // Check for existing node with the same identity key (category + subcategory + content)
+    const existing = this.db.prepare(`
+      SELECT id, category, subcategory, frequency, last_accessed, access_count
+      FROM nodes WHERE id = ?
+    `).get(nodeId) as Record<string, any> | undefined;
 
     const insertValues = {
       id: nodeId,
@@ -234,21 +315,25 @@ export class KnowledgeGraphDB {
       subcategory: node.subcategory,
       content: node.content,
       properties: propertiesStr,
+      source: node.source || 'agent',
+      trust: node.trust || 'high',
       created_at: now,
       last_accessed: now,
+      access_count: 0,
       frequency: 0,
       content_hash: contentHash,
     };
 
     if (existing) {
-      // Update existing node: extend its lifetime, boost frequency
+      // Update existing node: bump frequency, update access, preserve category (DB-4)
       this.db.prepare(`
         UPDATE nodes
         SET last_accessed = ?, frequency = frequency + 1,
-            subcategory = COALESCE(?, subcategory),
-            category = COALESCE(NULLIF(?, ''), category)
-        WHERE content_hash = ?
-      `).run(now, node.subcategory, node.category, contentHash);
+            access_count = access_count + 1,
+            subcategory = COALESCE(NULLIF(?, ''), subcategory),
+            properties = COALESCE(NULLIF(?, ''), properties)
+        WHERE id = ?
+      `).run(now, node.subcategory || null, propertiesStr || null, nodeId);
 
       return { id: existing.id, created: false };
     }
@@ -256,16 +341,19 @@ export class KnowledgeGraphDB {
     // Insert new node
     this.db.prepare(`
       INSERT INTO nodes (id, category, subcategory, content, properties,
-                         created_at, last_accessed, frequency, content_hash)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         source, trust, created_at, last_accessed, access_count, frequency, content_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       insertValues.id,
       insertValues.category,
       insertValues.subcategory,
       insertValues.content,
       insertValues.properties,
+      insertValues.source,
+      insertValues.trust,
       insertValues.created_at,
       insertValues.last_accessed,
+      insertValues.access_count,
       insertValues.frequency,
       insertValues.content_hash,
     );
@@ -371,6 +459,28 @@ export class KnowledgeGraphDB {
     return rows.map(r => this._rowToEdge(r));
   }
 
+  /**
+   * Get outgoing edges for a node (directional).
+   */
+  getOutgoingEdges(nodeId: string): KnowledgeEdge[] {
+    const rows = this.db.prepare(`
+      SELECT source_id, target_id, type, created_at, frequency
+      FROM edges WHERE source_id = ?
+    `).all(nodeId) as Record<string, any>[];
+    return rows.map(r => this._rowToEdge(r));
+  }
+
+  /**
+   * Get incoming edges for a node (directional).
+   */
+  getIncomingEdges(nodeId: string): KnowledgeEdge[] {
+    const rows = this.db.prepare(`
+      SELECT source_id, target_id, type, created_at, frequency
+      FROM edges WHERE target_id = ?
+    `).all(nodeId) as Record<string, any>[];
+    return rows.map(r => this._rowToEdge(r));
+  }
+
   // -----------------------------------------------------------------------
   // Node retrieval helpers (for search layer)
   // -----------------------------------------------------------------------
@@ -399,9 +509,42 @@ export class KnowledgeGraphDB {
 
     const rows = this.db.prepare(`
       SELECT id, category, subcategory, content, properties,
-             created_at, last_accessed, frequency, content_hash
+             source, trust, created_at, last_accessed, access_count, frequency, content_hash
       FROM nodes ${whereClause}
     `).all(...params) as Record<string, any>[];
+
+    return rows.map(row => this._rowToNode(row));
+  }
+
+  /**
+   * Get nodes for fallback embedding (capped, sorted by recency/frequency).
+   * Used when FTS5 returns 0 results — prevents embedding all nodes (SR-1).
+   */
+  getFallbackCandidates(limit: number = 50, categories?: string[], subcategories?: string[]): KnowledgeNode[] {
+    const whereClauses: string[] = [];
+    const params: any[] = [];
+
+    if (categories && categories.length > 0) {
+      const placeholders = categories.map(() => '?').join(',');
+      whereClauses.push(`category IN (${placeholders})`);
+      params.push(...categories);
+    }
+
+    if (subcategories && subcategories.length > 0) {
+      const placeholders = subcategories.map(() => '?').join(',');
+      whereClauses.push(`subcategory IN (${placeholders})`);
+      params.push(...subcategories);
+    }
+
+    const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    const rows = this.db.prepare(`
+      SELECT id, category, subcategory, content, properties,
+             source, trust, created_at, last_accessed, access_count, frequency, content_hash
+      FROM nodes ${whereClause}
+      ORDER BY (frequency + access_count) DESC, last_accessed DESC
+      LIMIT ?
+    `).all(...params, limit) as Record<string, any>[];
 
     return rows.map(row => this._rowToNode(row));
   }
@@ -416,12 +559,36 @@ export class KnowledgeGraphDB {
     return row.max_freq;
   }
 
+  /**
+   * Get the maximum access_count across all nodes (for normalization).
+   */
+  getMaxAccessCount(): number {
+    const row = this.db.prepare(
+      'SELECT COALESCE(MAX(access_count), 1) AS max_access FROM nodes',
+    ).get() as { max_access: number };
+    return row.max_access;
+  }
+
   // -----------------------------------------------------------------------
-  // Search (FTS5 + vector)
+  // Search (FTS5)
   // -----------------------------------------------------------------------
 
   /**
-   * FTS5 search with BM25 ranking (Phase 1 — no embeddings).
+   * Sanitize a query string for FTS5 MATCH.
+   * Wraps each term in double quotes to treat it as a literal phrase,
+   * escaping any embedded quotes. This handles operator characters (-, *, (, ), etc.)
+   * without losing BM25 ranking.
+   */
+  sanitizeFtsQuery(query: string): string {
+    // Split on whitespace, wrap each token in quotes, escape embedded quotes
+    const tokens = query.trim().split(/\s+/).filter(t => t.length > 0);
+    return tokens
+      .map(t => `"${t.replace(/"/g, '""')}"`)
+      .join(' ');
+  }
+
+  /**
+   * FTS5 search with BM25 ranking.
    */
   searchFTS5(query: string, maxResults: number = 10, categories?: string[], subcategories?: string[]): SearchHit[] {
     // Build WHERE clause for filters
@@ -446,116 +613,69 @@ export class KnowledgeGraphDB {
       const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
       const allNodes = this.db.prepare(`
         SELECT n.id, n.category, n.subcategory, n.content, n.properties,
-               n.created_at, n.last_accessed, n.frequency, n.content_hash
+               n.source, n.trust, n.created_at, n.last_accessed, n.access_count, n.frequency, n.content_hash
         FROM nodes n
         ${whereClause}
         ORDER BY n.created_at DESC
         LIMIT ?
       `).all(...params, maxResults) as Record<string, any>[];
 
-      const maxFreqRow = this.db.prepare(
-        'SELECT COALESCE(MAX(frequency), 1) AS max_freq FROM nodes'
-      ).get() as { max_freq: number };
-      const maxFreq = maxFreqRow.max_freq;
-      const now = Date.now();
-
-      return allNodes.map(row => {
-        const node = this._rowToNode(row);
-        const frequencyBoost = maxFreq > 1
-          ? Math.min(Math.log(node.frequency + 1) / Math.log(maxFreq + 1), 1.0)
-          : 0;
-        const hoursSinceAccessed = (now - node.lastAccessedAt) / (1000 * 60 * 60);
-        const freshnessScore = 1.0 / (1.0 + hoursSinceAccessed / 720);
-
-        return {
-          node,
-          bm25Score: 1.0,
-          vectorScore: null,
-          frequencyBoost,
-          freshnessScore,
-          compositeScore: (frequencyBoost * 0.3) + (freshnessScore * 0.3),
-          edges: this.getNodeEdges(node.id),
-        };
-      }).sort((a, b) => b.compositeScore - a.compositeScore).slice(0, maxResults);
+      return this.scoreHits(allNodes, 0, null, maxResults);
     }
 
     // FTS5 search: match against content, category, subcategory, properties
-    // With the external content model, we join on rowid (nodes.rowid = nodes_fts.rowid)
     const filterClause = whereClauses.length > 0 ? `AND ${whereClauses.join(' AND ')}` : '';
 
-    // FTS5 treats hyphens as grouping operators, so replace with underscores
-    // This ensures "auth-service" is tokenized as "authservice" matching the index
-    const escapedQuery = trimmedQuery.replace(/-/g, '_');
-    let ftsQuery: Record<string, any>[];
+    // Sanitize query for FTS5 MATCH — handles operator chars without losing BM25 (DB-7, DB-8)
+    const sanitizedQuery = this.sanitizeFtsQuery(trimmedQuery);
 
-    try {
-      ftsQuery = this.db.prepare(`
-        SELECT n.id, n.category, n.subcategory, n.content, n.properties,
-               n.created_at, n.last_accessed, n.frequency, n.content_hash,
-               nodes_fts.rank AS bm25_rank
-        FROM nodes n
-        JOIN nodes_fts ON n.rowid = nodes_fts.rowid
-        WHERE nodes_fts MATCH ?
-        ${filterClause}
-        ORDER BY bm25_rank ASC
-        LIMIT ?
-      `).all(escapedQuery, ...params, maxResults) as Record<string, any>[];
-    } catch (err) {
-      // FTS5's MATCH operator does not support parameter binding (?) —
-      // the ? is passed literally to FTS5's query parser, which interprets
-      // characters like ?, *, +, (, ) as FTS5 operators, causing syntax
-      // errors (e.g., "fts5: syntax error near '?'").
-      //
-      // Fall back to a simple LIKE query when FTS5 fails.
-      // This sacrifices BM25 ranking but ensures search still works.
-      console.warn('[kg-memory] FTS5 query failed, falling back to LIKE search:', (err as Error).message);
+    const ftsResults = this.db.prepare(`
+      SELECT n.id, n.category, n.subcategory, n.content, n.properties,
+             n.source, n.trust, n.created_at, n.last_accessed, n.access_count, n.frequency, n.content_hash,
+             nodes_fts.rank AS bm25_rank
+      FROM nodes n
+      JOIN nodes_fts ON n.rowid = nodes_fts.rowid
+      WHERE nodes_fts MATCH ?
+      ${filterClause}
+      ORDER BY bm25_rank ASC
+      LIMIT ?
+    `).all(sanitizedQuery, ...params, maxResults) as Record<string, any>[];
 
-      // Escape single quotes for SQL safety and use LIKE with wildcards.
-      // Each word gets its own LIKE clause for partial matching.
-      const words = escapedQuery.split(/\s+/).filter(w => w.length > 0);
-      const likeClauses = words.map(w => `n.content LIKE '%${w.replace(/'/g, "''")}%'`);
-      const likeClause = likeClauses.join(' OR ');
-      const whereClause = whereClauses.length > 0
-        ? `WHERE ${whereClauses.join(' AND ')} AND ${likeClause}`
-        : `WHERE ${likeClause}`;
+    return this.scoreHits(ftsResults, 1.0 / (1.0 + Math.abs(ftsResults.length > 0 ? (ftsResults[0] as any).bm25_rank : 0)), null, maxResults);
+  }
 
-      ftsQuery = this.db.prepare(`
-        SELECT n.id, n.category, n.subcategory, n.content, n.properties,
-               n.created_at, n.last_accessed, n.frequency, n.content_hash
-        FROM nodes n
-        ${whereClause}
-        ORDER BY n.created_at DESC
-        LIMIT ?
-      `).all(...params, maxResults) as Record<string, any>[];
-    }
-
-    // Get max frequency for normalization
-    const maxFreqRow = this.db.prepare(`
-      SELECT COALESCE(MAX(frequency), 1) AS max_freq FROM nodes
-    `).get() as { max_freq: number };
-    const maxFreq = maxFreqRow.max_freq;
-
+  /**
+   * Score a set of node rows into SearchHits.
+   * Single unified scoring function (SR-3).
+   */
+  private scoreHits(
+    rows: Record<string, any>[],
+    _bm25Ref: number,
+    _vectorRef: number | null,
+    maxResults: number,
+  ): SearchHit[] {
+    const maxFreq = this.getMaxFrequency();
+    const maxAccess = this.getMaxAccessCount();
     const now = Date.now();
 
-    return ftsQuery.map(row => {
+    return rows.map(row => {
       const node = this._rowToNode(row);
-      const bm25Raw = row.bm25_rank || 0;
 
-      // BM25 is lower = more relevant. Normalize to [0, 1] where 1 = most relevant.
-      // We use a simple inverse: 1 / (1 + |rank|)
+      // BM25 score (from FTS rank, or 0 for non-FTS paths)
+      const bm25Raw = row.bm25_rank || 0;
       const bm25Score = 1.0 / (1.0 + Math.abs(bm25Raw));
 
-      // Frequency boost: log-normalized
+      // Frequency boost: log-normalized using access_count (DB-5)
+      const accessScore = maxAccess > 1
+        ? Math.min(Math.log(node.accessCount + 1) / Math.log(maxAccess + 1), 1.0)
+        : 0;
       const frequencyBoost = maxFreq > 1
         ? Math.min(Math.log(node.frequency + 1) / Math.log(maxFreq + 1), 1.0)
         : 0;
 
       // Freshness: exponential decay with 30-day half-life
       const hoursSinceAccessed = (now - node.lastAccessedAt) / (1000 * 60 * 60);
-      const freshnessScore = 1.0 / (1.0 + hoursSinceAccessed / 720); // 30 days = 720 hours
-
-      // Composite score (Phase 1 weights)
-      const compositeScore = (bm25Score * 0.4) + (frequencyBoost * 0.3) + (freshnessScore * 0.3);
+      const freshnessScore = 1.0 / (1.0 + hoursSinceAccessed / 720);
 
       return {
         node,
@@ -563,7 +683,7 @@ export class KnowledgeGraphDB {
         vectorScore: null,
         frequencyBoost,
         freshnessScore,
-        compositeScore,
+        compositeScore: 0, // Set by caller with proper weights
         edges: this.getNodeEdges(node.id),
       };
     }).sort((a, b) => b.compositeScore - a.compositeScore).slice(0, maxResults);
@@ -575,6 +695,7 @@ export class KnowledgeGraphDB {
 
   /**
    * BFS traversal through edges up to maxDepth.
+   * Fetches edges once per node (DB-9).
    */
   getNeighbors(nodeId: string, maxDepth: number = 2): { nodeId: string; edges: KnowledgeEdge[] }[] {
     const visited = new Set<string>();
@@ -587,13 +708,14 @@ export class KnowledgeGraphDB {
       if (visited.has(id)) continue;
       visited.add(id);
 
+      // Fetch edges once per node (DB-9)
+      const edges = this.getNodeEdges(id);
+
       if (id !== nodeId) {
-        const edges = this.getNodeEdges(id);
         result.push({ nodeId: id, edges });
       }
 
       if (depth < maxDepth) {
-        const edges = this.getNodeEdges(id);
         for (const edge of edges) {
           const neighborId = edge.sourceId === id ? edge.targetId : edge.sourceId;
           if (!visited.has(neighborId)) {
@@ -638,12 +760,14 @@ export class KnowledgeGraphDB {
   /**
    * Prune old query log entries, keeping the most recent N.
    */
-  pruneQueryLog(limit: number = 1000): void {
+  pruneQueryLog(limit: number = 1000): number {
     const count = this.db.prepare('SELECT COUNT(*) AS cnt FROM query_log').get() as { cnt: number };
     if (count.cnt > limit) {
       const toDelete = count.cnt - limit;
       this.db.prepare(`DELETE FROM query_log WHERE id IN (SELECT id FROM query_log ORDER BY id ASC LIMIT ?)`).run(toDelete);
+      return toDelete;
     }
+    return 0;
   }
 
   /**
@@ -661,7 +785,7 @@ export class KnowledgeGraphDB {
   }
 
   // -----------------------------------------------------------------------
-  // Analytics
+  // Analytics (single source of truth — LG-1)
   // -----------------------------------------------------------------------
 
   /**
@@ -768,32 +892,120 @@ export class KnowledgeGraphDB {
     `).all() as { category: string; subcategory: string; count: number }[];
   }
 
+  /**
+   * Query type distribution (LG-2: aligned field names).
+   */
+  getQueryTypeDistribution(): { queryType: string; count: number }[] {
+    return this.db.prepare(`
+      SELECT query_type AS queryType, COUNT(*) AS count
+      FROM query_log
+      GROUP BY query_type
+      ORDER BY count DESC
+    `).all() as { queryType: string; count: number }[];
+  }
+
+  /**
+   * Agent action distribution (LG-2: aligned field names).
+   */
+  getAgentActionDistribution(): { action: string; count: number }[] {
+    return this.db.prepare(`
+      SELECT agent_action AS action, COUNT(*) AS count
+      FROM query_log
+      WHERE agent_action IS NOT NULL
+      GROUP BY agent_action
+      ORDER BY count DESC
+    `).all() as { action: string; count: number }[];
+  }
+
+  /**
+   * Graph growth over time (LG-3: true cumulative).
+   */
+  getGraphGrowth(limit: number = 30): { date: string; nodeCount: number }[] {
+    const rows = this.db.prepare(`
+      SELECT DATE(created_at / 1000, 'unixepoch') AS date, COUNT(*) AS count
+      FROM nodes
+      GROUP BY date
+      ORDER BY date ASC
+    `).all() as Array<{ date: string; count: number }>;
+
+    // True cumulative total (LG-3)
+    let cumulative = 0;
+    return rows.map(row => {
+      cumulative += row.count;
+      return { date: row.date, nodeCount: cumulative };
+    }).slice(-limit);
+  }
+
   // -----------------------------------------------------------------------
-  // Snapshots
+  // Session markers (replaces graph_snapshots — DB-6)
   // -----------------------------------------------------------------------
 
-  createSnapshot(summary: string = ''): number {
+  createMarker(event: string, summary: string = ''): number {
     const stats = this.getGraphStats();
-    const version = (this.db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS v FROM graph_snapshots').get() as { v: number }).v;
 
     this.db.prepare(`
-      INSERT INTO graph_snapshots (version, timestamp, node_count, edge_count, summary)
+      INSERT INTO session_markers (timestamp, event, node_count, edge_count, summary)
       VALUES (?, ?, ?, ?, ?)
     `).run(
-      version,
       new Date().toISOString(),
+      event,
       stats.nodeCount,
       stats.edgeCount,
       summary,
     );
 
-    return version;
+    const row = this.db.prepare('SELECT last_insert_rowid() AS id').get() as { id: number };
+    return row.id;
   }
 
-  getSnapshots(limit: number = 10): Record<string, any>[] {
+  getMarkers(limit: number = 10): Record<string, any>[] {
     return this.db.prepare(`
-      SELECT * FROM graph_snapshots ORDER BY version DESC LIMIT ?
+      SELECT * FROM session_markers ORDER BY id DESC LIMIT ?
     `).all(limit) as Record<string, any>[];
+  }
+
+  pruneMarkers(keepLast: number = 50): void {
+    // Find the (keepLast+1)th oldest marker and delete everything up to (but not including) it
+    const row = this.db.prepare(`
+      SELECT id FROM session_markers ORDER BY id ASC LIMIT 1 OFFSET ?
+    `).get(keepLast) as { id: number } | undefined;
+    if (row) {
+      this.db.prepare('DELETE FROM session_markers WHERE id < ?').run(row.id);
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Vector storage (for search layer — SR-2)
+  // -----------------------------------------------------------------------
+
+  storeVector(nodeId: string, embedding: number[], model: string): void {
+    const buffer = Buffer.from(new Float32Array(embedding).buffer);
+    try {
+      this.db.prepare(
+        'INSERT OR REPLACE INTO node_vectors (node_id, embedding, model, dim) VALUES (?, ?, ?, ?)'
+      ).run(nodeId, buffer, model, embedding.length);
+    } catch (err) {
+      console.warn('[kg-memory] Failed to store embedding:', (err as Error).message);
+    }
+  }
+
+  getVector(nodeId: string): { embedding: number[]; model: string; dim: number } | null {
+    try {
+      const row = this.db.prepare(
+        'SELECT embedding, model, dim FROM node_vectors WHERE node_id = ?'
+      ).get(nodeId) as { embedding: Buffer; model: string; dim: number } | undefined;
+
+      if (!row) return null;
+
+      const floatArray = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
+      return {
+        embedding: Array.from(floatArray),
+        model: row.model,
+        dim: row.dim,
+      };
+    } catch {
+      return null;
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -807,8 +1019,11 @@ export class KnowledgeGraphDB {
       subcategory: row.subcategory,
       content: row.content,
       properties: row.properties ? JSON.parse(row.properties) : null,
+      source: row.source || 'agent',
+      trust: row.trust || 'high',
       createdAt: row.created_at,
       lastAccessedAt: row.last_accessed,
+      accessCount: row.access_count || 0,
       frequency: row.frequency,
       contentHash: row.content_hash,
     };
