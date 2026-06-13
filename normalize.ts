@@ -112,64 +112,83 @@ export function normalizeSubcategory(sub: string | undefined): string | undefine
 }
 
 // ---------------------------------------------------------------------------
-// Edge type synonyms
+// Edge type synonyms with direction semantics (NM-1)
 // ---------------------------------------------------------------------------
 
-const EDGE_TYPE_SYNONYMS: Record<string, string> = {
+interface EdgeSynonymEntry {
+  canonical: string;
+  invert: boolean;  // If true, swap source/target when normalizing
+}
+
+const EDGE_TYPE_SYNONYMS: Record<string, EdgeSynonymEntry> = {
   // blocks
-  'blocks': 'blocks',
-  'blocking': 'blocks',
-  'blocked-by': 'blocks',
-  'blocks-on': 'blocks',
+  'blocks': { canonical: 'blocks', invert: false },
+  'blocking': { canonical: 'blocks', invert: false },
+  'blocked-by': { canonical: 'blocks', invert: true },    // A blocked-by B → B blocks A
+  'blocks-on': { canonical: 'blocks', invert: false },
   // depends-on
-  'dep-on': 'depends-on',
-  'depends-on': 'depends-on',
-  'dependent': 'depends-on',
-  'dependency': 'depends-on',
-  'dependencies': 'depends-on',
-  'dependent-on': 'depends-on',
-  // relates-to
-  'relates-to': 'relates-to',
-  'related': 'relates-to',
-  'related-to': 'relates-to',
-  'relates': 'relates-to',
+  'dep-on': { canonical: 'depends-on', invert: false },
+  'depends-on': { canonical: 'depends-on', invert: false },
+  'dependent': { canonical: 'depends-on', invert: false },
+  'dependency': { canonical: 'depends-on', invert: false },
+  'dependencies': { canonical: 'depends-on', invert: false },
+  'dependent-on': { canonical: 'depends-on', invert: false },
+  // relates-to (symmetric, no inversion needed)
+  'relates-to': { canonical: 'relates-to', invert: false },
+  'related': { canonical: 'relates-to', invert: false },
+  'related-to': { canonical: 'relates-to', invert: false },
+  'relates': { canonical: 'relates-to', invert: false },
   // contradicts
-  'contradicts': 'contradicts',
-  'contradiction': 'contradicts',
-  'contradictory': 'contradicts',
-  'contradicts-with': 'contradicts',
+  'contradicts': { canonical: 'contradicts', invert: false },
+  'contradiction': { canonical: 'contradicts', invert: false },
+  'contradictory': { canonical: 'contradicts', invert: false },
+  'contradicts-with': { canonical: 'contradicts', invert: false },
   // supersedes
-  'supersedes': 'supersedes',
-  'superseded': 'supersedes',
-  'superseded-by': 'supersedes',
-  'supersede': 'supersedes',
+  'supersedes': { canonical: 'supersedes', invert: false },
+  'superseded': { canonical: 'supersedes', invert: true },      // A superseded B → B supersedes A
+  'superseded-by': { canonical: 'supersedes', invert: true },   // A superseded-by B → B supersedes A
+  'supersede': { canonical: 'supersedes', invert: false },
   // used-by
-  'used-by': 'used-by',
-  'uses': 'used-by',
-  'used': 'used-by',
-  'used-on': 'used-by',
+  'used-by': { canonical: 'used-by', invert: false },
+  'uses': { canonical: 'used-by', invert: true },               // A uses B → B used-by A
+  'used': { canonical: 'used-by', invert: false },
+  'used-on': { canonical: 'used-by', invert: false },
   // implements
-  'implements': 'implements',
-  'implementation': 'implements',
-  'implemented': 'implements',
-  'implementing': 'implements',
+  'implements': { canonical: 'implements', invert: false },
+  'implementation': { canonical: 'implements', invert: false },
+  'implemented': { canonical: 'implements', invert: false },
+  'implementing': { canonical: 'implements', invert: false },
   // causes
-  'causes': 'causes',
-  'caused-by': 'causes',
-  'causality': 'causes',
-  'causal': 'causes',
+  'causes': { canonical: 'causes', invert: false },
+  'caused-by': { canonical: 'causes', invert: true },           // A caused-by B → B causes A
+  'causality': { canonical: 'causes', invert: false },
+  'causal': { canonical: 'causes', invert: false },
 };
 
 /**
  * Normalize an edge type string.
- * Steps: trim → lowercase → replace spaces/underscores with hyphens → synonym lookup.
+ * Returns the canonical type and whether endpoints should be swapped (NM-1).
  */
-export function normalizeEdgeType(rawType: string): string {
-  if (!rawType) return 'relates-to';
+export function normalizeEdgeType(rawType: string): { canonical: string; invert: boolean } {
+  if (!rawType) return { canonical: 'relates-to', invert: false };
   const trimmed = rawType.trim().toLowerCase();
-  if (!trimmed) return 'relates-to';
+  if (!trimmed) return { canonical: 'relates-to', invert: false };
   const normalized = trimmed.replace(/[\s_]+/g, '-');
-  return EDGE_TYPE_SYNONYMS[normalized] ?? normalized;
+
+  const entry = EDGE_TYPE_SYNONYMS[normalized];
+  if (entry) {
+    return entry;
+  }
+
+  // Unknown type — allow free-form but don't invert (NM-2)
+  return { canonical: normalized, invert: false };
+}
+
+/**
+ * Check if an edge type is canonical (NM-2).
+ */
+export function isCanonicalEdgeType(type: string): boolean {
+  return CANONICAL_EDGE_TYPES.includes(type as EdgeType);
 }
 
 // ---------------------------------------------------------------------------

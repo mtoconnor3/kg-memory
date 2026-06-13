@@ -5,12 +5,12 @@
  *
  * Tools:  kg_add, kg_search, kg_link, kg_neighbors, kg_get, kg_delete, kg_query
  * Hooks:  session_start, before_agent_start, context, session_before_compact, session_shutdown
- * Commands: /kg (graph stats), /kg-query (analytics)
+ * Commands: /kg (graph overview), /kg-query (analytics)
  */
 
 import path from 'path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { openKnowledgeGraph } from './db.js';
+import { openKnowledgeGraph } from './db.ts';
 import {
   kgAdd,
   kgSearch,
@@ -19,7 +19,7 @@ import {
   kgGet,
   kgDelete,
   kgQuery,
-} from './tools.js';
+} from './tools.ts';
 import {
   onSessionStart,
   onBeforeAgentStart,
@@ -27,23 +27,20 @@ import {
   onSessionBeforeCompact,
   onSessionShutdown,
   onInput,
-} from './hooks.js';
+  clearInjectedIds,
+} from './hooks.ts';
 import {
+  generateGraphOverview,
   generateFormattedReport,
-  generateAnalyticsReport,
-  formatAnalyticsReport,
   logQuery,
   pruneOldEntries,
-  getMostSurfacedNodes,
-  getZeroResultQueries,
-  getQueryTypeDistribution,
-  getCategoryDistribution,
-} from './logging.js';
+} from './logging.ts';
 import {
   DEFAULT_CONFIG,
   validateConfig,
-} from './search.js';
-import { normalizeSubcategory, normalizeEdgeType } from './normalize.js';
+  type KgConfig,
+} from './search.ts';
+import { normalizeSubcategory, normalizeEdgeType } from './normalize.ts';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -76,7 +73,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // Resolve path: config overrides default
   const graphPath = kgConfig.graphPath || resolveGraphPath();
 
-  // Validate and merge config
+  // Validate and merge config (per-field validation — CFG-2)
   const searchConfig = validateConfig(kgConfig);
 
   // Open (or create) the database
@@ -92,24 +89,21 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   registerHooks(db, searchConfig, pi);
 
   // Register commands
-  registerCommands(db, pi);
+  registerCommands(db, searchConfig, pi);
 
   // Auto-prune query log on startup
-  pruneOldEntries(db, kgConfig.queryLogLimit || 1000);
+  pruneOldEntries(db, searchConfig.queryLogLimit);
 }
 
 // ---------------------------------------------------------------------------
 // Tool registration
 // ---------------------------------------------------------------------------
 
-function registerTools(db: ReturnType<typeof openKnowledgeGraph>, config: ReturnType<typeof validateConfig>, pi: ExtensionAPI): void {
-  // pi.registerTool is called by Pi's extension system
-  // We expose the tool functions for Pi to call
-
+function registerTools(db: ReturnType<typeof openKnowledgeGraph>, config: KgConfig, pi: ExtensionAPI): void {
   // kg_add
   pi.registerTool({
     name: 'kg_add',
-    description: 'Add a node to the knowledge graph. Normalizes category, subcategory, and edge types. Deduplicates by content hash.',
+    description: 'Add a node to the knowledge graph. Normalizes category, subcategory, and edge types. Deduplicates by (category, subcategory, content) identity.',
     parameters: {
       type: 'object',
       properties: {
@@ -119,7 +113,7 @@ function registerTools(db: ReturnType<typeof openKnowledgeGraph>, config: Return
         },
         content: {
           type: 'string',
-          description: 'The knowledge content (fact, decision, warning, etc.)',
+          description: 'The knowledge content (fact, decision, warning, etc.). Max 4000 characters.',
         },
         subcategory: {
           type: 'string',
@@ -176,7 +170,7 @@ function registerTools(db: ReturnType<typeof openKnowledgeGraph>, config: Return
         maxResults: params.maxResults,
         categories: params.categories,
         subcategories: params.subcategories,
-      });
+      }, config);
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     },
   });
@@ -184,7 +178,7 @@ function registerTools(db: ReturnType<typeof openKnowledgeGraph>, config: Return
   // kg_link
   pi.registerTool({
     name: 'kg_link',
-    description: 'Create an edge between two nodes. Normalizes edge types (blocks, depends-on, relates-to, etc.).',
+    description: 'Create an edge between two nodes. Normalizes edge types (blocks, depends-on, relates-to, etc.). Inverse types (blocked-by, caused-by) swap endpoints.',
     parameters: {
       type: 'object',
       properties: {
@@ -309,7 +303,7 @@ function registerTools(db: ReturnType<typeof openKnowledgeGraph>, config: Return
 // Hook registration
 // ---------------------------------------------------------------------------
 
-function registerHooks(db: ReturnType<typeof openKnowledgeGraph>, config: ReturnType<typeof validateConfig>, pi: ExtensionAPI): void {
+function registerHooks(db: ReturnType<typeof openKnowledgeGraph>, config: KgConfig, pi: ExtensionAPI): void {
   // session_start
   pi.on('session_start', (context: Record<string, any>) => {
     const result = onSessionStart(db, {
@@ -324,13 +318,16 @@ function registerHooks(db: ReturnType<typeof openKnowledgeGraph>, config: Return
 
   // before_agent_start
   pi.on('before_agent_start', async (context: Record<string, any>) => {
+    // Clear per-turn injection tracking (HK-7)
+    clearInjectedIds();
+
     const result = await onBeforeAgentStart(db, {
       sessionId: context.sessionId || 'unknown',
       previousSessionId: context.previousSessionId,
     }, config);
 
     if (result.injection) {
-      // Inject into system prompt
+      // Inject into system prompt (HK-3: provenance-gated)
       pi.systemPrompt?.inject?.(result.injection);
     }
   });
@@ -363,7 +360,7 @@ function registerHooks(db: ReturnType<typeof openKnowledgeGraph>, config: Return
   pi.on('session_shutdown', (context: Record<string, any>) => {
     onSessionShutdown(db, {
       sessionId: context.sessionId || 'unknown',
-    });
+    }, config);
   });
 
   // input — Auto-surface relevant KG nodes on user input
@@ -387,24 +384,24 @@ function registerHooks(db: ReturnType<typeof openKnowledgeGraph>, config: Return
 }
 
 // ---------------------------------------------------------------------------
-// Command registration
+// Command registration (LG-4: differentiated commands)
 // ---------------------------------------------------------------------------
 
-function registerCommands(db: ReturnType<typeof openKnowledgeGraph>, pi: ExtensionAPI): void {
-  // /kg — Graph overview
+function registerCommands(db: ReturnType<typeof openKnowledgeGraph>, config: KgConfig, pi: ExtensionAPI): void {
+  // /kg — Graph overview (node count, edges, categories, top nodes)
   pi.registerCommand('kg', {
-    description: 'Show knowledge graph statistics: node count, edge count, category distribution, most surfaced nodes.',
+    description: 'Show knowledge graph overview: node count, edge count, category distribution, most surfaced nodes.',
     handler: async () => {
-      const report = generateFormattedReport(db, '', { queryLogLimit: 1000 });
+      const report = generateGraphOverview(db);
       return report;
     },
   });
 
-  // /kg-query — Query log analysis
+  // /kg-query — Query log analytics (gaps, query types, agent actions, growth)
   pi.registerCommand('kg-query', {
-    description: 'Show query log analytics: most surfaced nodes, zero-result gaps, category distribution, query types.',
+    description: 'Show query log analytics: most surfaced nodes, zero-result gaps, category distribution, query types, agent actions.',
     handler: async () => {
-      const report = generateFormattedReport(db, '', { queryLogLimit: 1000 });
+      const report = generateFormattedReport(db, '', { queryLogLimit: config.queryLogLimit });
       return report;
     },
   });
@@ -415,7 +412,7 @@ function registerCommands(db: ReturnType<typeof openKnowledgeGraph>, pi: Extensi
 // ---------------------------------------------------------------------------
 
 export { openKnowledgeGraph, kgAdd, kgSearch, kgLink, kgNeighbors, kgGet, kgDelete, kgQuery };
-export { onSessionStart, onBeforeAgentStart, onContext, onSessionBeforeCompact, onSessionShutdown, onInput };
-export { generateFormattedReport, generateAnalyticsReport, formatAnalyticsReport };
+export { onSessionStart, onBeforeAgentStart, onContext, onSessionBeforeCompact, onSessionShutdown, onInput, clearInjectedIds };
+export { generateGraphOverview, generateFormattedReport };
 export { normalizeSubcategory, normalizeEdgeType };
 export { DEFAULT_CONFIG, validateConfig };
