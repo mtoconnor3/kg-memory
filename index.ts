@@ -1,0 +1,421 @@
+/**
+ * Knowledge Graph Memory Extension — Entry Point
+ *
+ * Registers tools, hooks, and commands with Pi's extension system:
+ *
+ * Tools:  kg_add, kg_search, kg_link, kg_neighbors, kg_get, kg_delete, kg_query
+ * Hooks:  session_start, before_agent_start, context, session_before_compact, session_shutdown
+ * Commands: /kg (graph stats), /kg-query (analytics)
+ */
+
+import path from 'path';
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { openKnowledgeGraph } from './db.js';
+import {
+  kgAdd,
+  kgSearch,
+  kgLink,
+  kgNeighbors,
+  kgGet,
+  kgDelete,
+  kgQuery,
+} from './tools.js';
+import {
+  onSessionStart,
+  onBeforeAgentStart,
+  onContext,
+  onSessionBeforeCompact,
+  onSessionShutdown,
+  onInput,
+} from './hooks.js';
+import {
+  generateFormattedReport,
+  generateAnalyticsReport,
+  formatAnalyticsReport,
+  logQuery,
+  pruneOldEntries,
+  getMostSurfacedNodes,
+  getZeroResultQueries,
+  getQueryTypeDistribution,
+  getCategoryDistribution,
+} from './logging.js';
+import {
+  DEFAULT_CONFIG,
+  validateConfig,
+} from './search.js';
+import { normalizeSubcategory, normalizeEdgeType } from './normalize.js';
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+function resolveGraphPath(): string {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || '.';
+  return path.join(homeDir, '.pi', 'agent', 'memory', 'kg.db');
+}
+
+async function loadConfig(): Promise<Record<string, any>> {
+  try {
+    const settingsPath = path.join(process.env.HOME || '.', '.pi', 'agent', 'settings.json');
+    const fs = await import('fs');
+    const raw = fs.readFileSync(settingsPath, 'utf-8');
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Extension initialization
+// ---------------------------------------------------------------------------
+
+export default async function (pi: ExtensionAPI): Promise<void> {
+  const config = await loadConfig();
+  const kgConfig = config.kgMemory || {};
+
+  // Resolve path: config overrides default
+  const graphPath = kgConfig.graphPath || resolveGraphPath();
+
+  // Validate and merge config
+  const searchConfig = validateConfig(kgConfig);
+
+  // Open (or create) the database
+  const db = openKnowledgeGraph(graphPath);
+
+  console.log(`[kg-memory] Knowledge graph initialized: ${graphPath}`);
+  console.log(`[kg-memory] Embedding: ${searchConfig.embeddingEndpoint} (model: ${searchConfig.embeddingModel})`);
+
+  // Register tools
+  registerTools(db, searchConfig, pi);
+
+  // Register hooks
+  registerHooks(db, searchConfig, pi);
+
+  // Register commands
+  registerCommands(db, pi);
+
+  // Auto-prune query log on startup
+  pruneOldEntries(db, kgConfig.queryLogLimit || 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Tool registration
+// ---------------------------------------------------------------------------
+
+function registerTools(db: ReturnType<typeof openKnowledgeGraph>, config: ReturnType<typeof validateConfig>, pi: ExtensionAPI): void {
+  // pi.registerTool is called by Pi's extension system
+  // We expose the tool functions for Pi to call
+
+  // kg_add
+  pi.registerTool({
+    name: 'kg_add',
+    description: 'Add a node to the knowledge graph. Normalizes category, subcategory, and edge types. Deduplicates by content hash.',
+    parameters: {
+      type: 'object',
+      properties: {
+        category: {
+          type: 'string',
+          description: 'Node category: knowledge, project, people, system, tool, error, process',
+        },
+        content: {
+          type: 'string',
+          description: 'The knowledge content (fact, decision, warning, etc.)',
+        },
+        subcategory: {
+          type: 'string',
+          description: 'Optional subcategory (e.g., fact, bug, developer). Normalized via synonym map.',
+        },
+        properties: {
+          type: 'object',
+          description: 'Optional freeform metadata as key-value pairs.',
+        },
+      },
+      required: ['category', 'content'],
+    },
+    execute: async (_toolCallId: string, params: Record<string, any>) => {
+      const result = kgAdd(db, {
+        category: params.category,
+        content: params.content,
+        subcategory: params.subcategory,
+        properties: params.properties,
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    },
+  });
+
+  // kg_search
+  pi.registerTool({
+    name: 'kg_search',
+    description: 'Search the knowledge graph. Hybrid search: FTS5 (BM25) + vector (if LMStudio available). Falls back to pure FTS5.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Search query text.',
+        },
+        maxResults: {
+          type: 'number',
+          description: 'Maximum number of results (default: 10).',
+        },
+        categories: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Filter by categories (e.g., ["knowledge", "error"]).',
+        },
+        subcategories: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Filter by subcategories (e.g., ["bug", "fact"]).',
+        },
+      },
+    },
+    execute: async (_toolCallId: string, params: Record<string, any>) => {
+      const result = await kgSearch(db, {
+        query: params.query ?? '',
+        maxResults: params.maxResults,
+        categories: params.categories,
+        subcategories: params.subcategories,
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    },
+  });
+
+  // kg_link
+  pi.registerTool({
+    name: 'kg_link',
+    description: 'Create an edge between two nodes. Normalizes edge types (blocks, depends-on, relates-to, etc.).',
+    parameters: {
+      type: 'object',
+      properties: {
+        sourceId: {
+          type: 'string',
+          description: 'ID of the source node.',
+        },
+        targetId: {
+          type: 'string',
+          description: 'ID of the target node.',
+        },
+        type: {
+          type: 'string',
+          description: 'Edge type (e.g., "blocks", "depends-on", "relates-to"). Normalized via synonym map.',
+        },
+      },
+      required: ['sourceId', 'targetId', 'type'],
+    },
+    execute: async (_toolCallId: string, params: Record<string, any>) => {
+      const result = kgLink(db, {
+        sourceId: params.sourceId,
+        targetId: params.targetId,
+        type: params.type,
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    },
+  });
+
+  // kg_neighbors
+  pi.registerTool({
+    name: 'kg_neighbors',
+    description: 'Find connected nodes via BFS traversal through edges.',
+    parameters: {
+      type: 'object',
+      properties: {
+        nodeId: {
+          type: 'string',
+          description: 'ID of the node to find neighbors for.',
+        },
+        maxDepth: {
+          type: 'number',
+          description: 'Maximum BFS depth (default: 2).',
+        },
+      },
+      required: ['nodeId'],
+    },
+    execute: async (_toolCallId: string, params: Record<string, any>) => {
+      const result = kgNeighbors(db, params.nodeId, params.maxDepth);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    },
+  });
+
+  // kg_get
+  pi.registerTool({
+    name: 'kg_get',
+    description: 'Get full node details including all incident edges.',
+    parameters: {
+      type: 'object',
+      properties: {
+        nodeId: {
+          type: 'string',
+          description: 'ID of the node to retrieve.',
+        },
+      },
+      required: ['nodeId'],
+    },
+    execute: async (_toolCallId: string, params: Record<string, any>) => {
+      const result = kgGet(db, params.nodeId);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    },
+  });
+
+  // kg_delete
+  pi.registerTool({
+    name: 'kg_delete',
+    description: 'Remove a node and all incident edges from the knowledge graph.',
+    parameters: {
+      type: 'object',
+      properties: {
+        nodeId: {
+          type: 'string',
+          description: 'ID of the node to delete.',
+        },
+      },
+      required: ['nodeId'],
+    },
+    execute: async (_toolCallId: string, params: Record<string, any>) => {
+      const result = kgDelete(db, params.nodeId);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    },
+  });
+
+  // kg_query
+  pi.registerTool({
+    name: 'kg_query',
+    description: 'Query the query log for analytics: graph stats, most surfaced nodes, gaps, distribution.',
+    parameters: {
+      type: 'object',
+      properties: {
+        queryType: {
+          type: 'string',
+          description: 'Filter by query type (search, kg_add, kg_link, etc.).',
+        },
+        maxResults: {
+          type: 'number',
+          description: 'Maximum number of results (default: 20).',
+        },
+      },
+      required: [],
+    },
+    execute: async (_toolCallId: string, params: Record<string, any>) => {
+      const result = kgQuery(db, {
+        queryType: params.queryType,
+        maxResults: params.maxResults,
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Hook registration
+// ---------------------------------------------------------------------------
+
+function registerHooks(db: ReturnType<typeof openKnowledgeGraph>, config: ReturnType<typeof validateConfig>, pi: ExtensionAPI): void {
+  // session_start
+  pi.on('session_start', (context: Record<string, any>) => {
+    const result = onSessionStart(db, {
+      sessionId: context.sessionId || 'unknown',
+      project: context.project,
+    }, config);
+
+    if (result.notification) {
+      pi.ui?.notify?.(result.notification);
+    }
+  });
+
+  // before_agent_start
+  pi.on('before_agent_start', async (context: Record<string, any>) => {
+    const result = await onBeforeAgentStart(db, {
+      sessionId: context.sessionId || 'unknown',
+      previousSessionId: context.previousSessionId,
+    }, config);
+
+    if (result.injection) {
+      // Inject into system prompt
+      pi.systemPrompt?.inject?.(result.injection);
+    }
+  });
+
+  // context (after compaction)
+  pi.on('context', async (context: Record<string, any>) => {
+    const result = await onContext(db, {
+      sessionId: context.sessionId || 'unknown',
+      compactedContent: context.compactedContent || '',
+    }, config);
+
+    if (result.injection) {
+      pi.systemPrompt?.inject?.(result.injection);
+    }
+  });
+
+  // session_before_compact
+  pi.on('session_before_compact', (context: Record<string, any>) => {
+    const result = onSessionBeforeCompact(db, {
+      sessionId: context.sessionId || 'unknown',
+      sessionHistory: context.sessionHistory || [],
+    });
+
+    if (result.injection) {
+      pi.systemPrompt?.inject?.(result.injection);
+    }
+  });
+
+  // session_shutdown
+  pi.on('session_shutdown', (context: Record<string, any>) => {
+    onSessionShutdown(db, {
+      sessionId: context.sessionId || 'unknown',
+    });
+  });
+
+  // input — Auto-surface relevant KG nodes on user input
+  pi.on('input', async (event: Record<string, any>) => {
+    try {
+      const injection = await onInput(db, {
+        text: event.text ?? '',
+        images: event.images,
+        source: event.source,
+        streamingBehavior: event.streamingBehavior,
+      }, config);
+
+      if (injection) {
+        pi.systemPrompt?.inject?.(injection);
+      }
+    } catch (err) {
+      // Fail silently — don't break the agent turn
+      console.warn('[kg-memory] Input hook failed:', (err as Error).message);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Command registration
+// ---------------------------------------------------------------------------
+
+function registerCommands(db: ReturnType<typeof openKnowledgeGraph>, pi: ExtensionAPI): void {
+  // /kg — Graph overview
+  pi.registerCommand('kg', {
+    description: 'Show knowledge graph statistics: node count, edge count, category distribution, most surfaced nodes.',
+    handler: async () => {
+      const report = generateFormattedReport(db, '', { queryLogLimit: 1000 });
+      return report;
+    },
+  });
+
+  // /kg-query — Query log analysis
+  pi.registerCommand('kg-query', {
+    description: 'Show query log analytics: most surfaced nodes, zero-result gaps, category distribution, query types.',
+    handler: async () => {
+      const report = generateFormattedReport(db, '', { queryLogLimit: 1000 });
+      return report;
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Exports (for testing)
+// ---------------------------------------------------------------------------
+
+export { openKnowledgeGraph, kgAdd, kgSearch, kgLink, kgNeighbors, kgGet, kgDelete, kgQuery };
+export { onSessionStart, onBeforeAgentStart, onContext, onSessionBeforeCompact, onSessionShutdown, onInput };
+export { generateFormattedReport, generateAnalyticsReport, formatAnalyticsReport };
+export { normalizeSubcategory, normalizeEdgeType };
+export { DEFAULT_CONFIG, validateConfig };
