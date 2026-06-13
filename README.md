@@ -23,14 +23,14 @@ kg_link("node-id-1", "node-id-2", "depends-on")
 - **Advanced Hybrid Search**: Combines FTS5 (BM25), vector similarity, node frequency, and temporal freshness into a single composite score for superior relevance.
 - **Direction-Aware Edge Normalization**: Edge types are normalized via synonym maps and automatically handle inverse relationships (e.g., `blocked-by` $\rightarrow$ `blocks` with swapped endpoints).
 - **Query Analytics**: Generates comprehensive reports including growth trends, agent action distribution, and query type analytics.
-- **Deduplication**: Content hash prevents duplicate nodes.
+- **Deduplication**: Prevents duplicate nodes by checking (category, subcategory, content) identity.
 - **Graph traversal**: BFS through edges with configurable depth.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `kg_add(category, content, subcategory?, properties?)` | Add a node. Normalizes category/subcategory. Deduplicates by content hash. |
+| `kg_add(category, content, subcategory?, properties?)` | Add a node. Normalizes category/subcategory. Deduplicates by (category, subcategory, content). |
 | `kg_search(query, maxResults?, categories?, subcategories?)` | Advanced Hybrid search: FTS5 (BM25) + Vector + Frequency + Freshness. |
 | `kg_link(sourceId, targetId, type)` | Create an edge. Handles directionality and normalization. |
 | `kg_neighbors(nodeId, maxDepth?)` | BFS traversal through edges. |
@@ -78,13 +78,13 @@ All parameters are configurable via Pi's settings system under the `kgMemory` ke
     "embeddingEndpoint": "http://192.168.1.1:1234/v1/embeddings",
     "embeddingModel": "nomic-embed-text-v1.5",
     "maxResults": 10,
-    "injectionBudget": 500,
+    "injectionBudget": 2000,
     "queryLogLimit": 1000,
     "staleNodeDays": 90,
-    "ftxF5Weight": 0.4,
+    "ftsF5Weight": 0.4,
     "vectorWeight": 0.3,
-    "frequencyWeight": 0.3,
-    "freshnessWeight": 0.3
+    "frequencyWeight": 0.15,
+    "freshnessWeight": 0.15
   }
 }
 ```
