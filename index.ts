@@ -39,6 +39,7 @@ import {
   DEFAULT_CONFIG,
   validateConfig,
   batchEmbed,
+  getEmbedding,
   type KgConfig,
 } from './search.ts';
 import { normalizeSubcategory, normalizeEdgeType } from './normalize.ts';
@@ -126,26 +127,35 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   console.log(`[kg-memory] Knowledge graph initialized: ${graphPath}`);
   console.log(`[kg-memory] Embedding: ${searchConfig.embeddingEndpoint} (model: ${searchConfig.embeddingModel})`);
 
-  // Backfill vec_nodes KNN index from existing node_vectors (idempotent)
-  const backfilled = db.backfillVecIndex();
-  if (backfilled > 0) {
-    console.log(`[kg-memory] Backfilled ${backfilled} vectors into vec_nodes KNN index`);
-  }
-
-  // Embed any nodes that lack vectors (one-time backfill for existing content)
-  await backfillMissingVectors(db, searchConfig);
-
-  // Register tools
+  // Register first so the agent is usable immediately
   registerTools(db, searchConfig, pi);
-
-  // Register hooks
   registerHooks(db, searchConfig, pi);
-
-  // Register commands
   registerCommands(db, searchConfig, pi);
+
+  // --- index maintenance below; must not block init on the embedding endpoint ---
+
+  // Detect an embedding-model change and purge vectors for re-embed.
+  // A model swap at a *different* dimension also requires bumping EMBED_DIM
+  // and restarting (the float[N] width is fixed at table creation). The purge
+  // handles the same-dimension case fully.
+  const storedModel = db.getMeta('embedding_model');
+  if (storedModel && storedModel !== searchConfig.embeddingModel) {
+    console.log(`[kg-memory] Embedding model changed (${storedModel} -> ${searchConfig.embeddingModel}); purging vectors for re-embed`);
+    db.purgeVectors();
+  }
+  db.setMeta('embedding_model', searchConfig.embeddingModel);
+
+  // Repopulate the KNN index from any surviving node_vectors (sync, no network)
+  const backfilled = db.backfillVecIndex();
+  if (backfilled > 0) console.log(`[kg-memory] Backfilled ${backfilled} vectors into vec_nodes`);
 
   // Auto-prune query log on startup
   pruneOldEntries(db, searchConfig.queryLogLimit);
+
+  // Embed any nodes still lacking vectors, without blocking startup.
+  void backfillMissingVectors(db, searchConfig).catch(err =>
+    console.warn('[kg-memory] Vector backfill error:', (err as Error).message),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +196,18 @@ function registerTools(db: ReturnType<typeof openKnowledgeGraph>, config: KgConf
         subcategory: params.subcategory,
         properties: params.properties,
       });
+
+      // Embed-on-create so the node is KNN-searchable within this session.
+      // Fail soft: FTS still works if the endpoint is down.
+      if (result.created && result.nodeId) {
+        try {
+          const emb = await getEmbedding(params.content, config, 10000);
+          if (emb) db.storeVector(result.nodeId, emb, config.embeddingModel);
+        } catch (err) {
+          console.warn('[kg-memory] embed-on-add failed:', (err as Error).message);
+        }
+      }
+
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     },
   });

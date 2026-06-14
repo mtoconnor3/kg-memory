@@ -107,7 +107,7 @@ describe('validateConfig', () => {
   it('merges partial config with defaults', () => {
     const config = validateConfig({ maxResults: 20 });
     expect(config.maxResults).toBe(20);
-    expect(config.embeddingEndpoint).toBe(DEFAULT_CONFIG.embeddingEndpoint);
+    expect(config.embeddingEndpoint).toBe('http://localhost:1234/v1/embeddings');
   });
 
   it('validates weights per-field, not all-or-nothing (CFG-2)', () => {
@@ -166,36 +166,48 @@ describe('searchHybrid', () => {
     expect(results.length).toBe(2);
   });
 
-  // B.5: Vector search is no longer gated by FTS
-  it('retrieves semantically-relevant, lexically-disjoint nodes via KNN', async () => {
-    // We can't test actual semantic similarity without a real embedding endpoint,
-    // but we can verify the KNN path is exercised by mocking getQueryEmbedding
-    // and using db.knnSearch directly.
-    // This test verifies the union path works: a node with a vector but no FTS match.
-    const node = db.saveNode({ category: 'knowledge', content: 'Quantum entanglement describes correlated states' });
-    // Store a fake vector (all 768 dims)
-    const fakeVec = Array.from({ length: 768 }, (_, i) => i % 2 === 0 ? 0.1 : -0.1);
-    db.storeVector(node.id, fakeVec, DEFAULT_CONFIG.embeddingModel);
+  // 4.3: Vector search is no longer gated by FTS
+  it('surfaces a lexically-disjoint node through the KNN path', async () => {
+    if (!db.vecAvailable) return;
+    const vec = Array.from({ length: 768 }, (_, i) => Math.sin(i));
+    const { id } = db.saveNode({ category: 'knowledge', content: 'mitochondria are organelles' });
+    db.storeVector(id, vec, DEFAULT_CONFIG.embeddingModel);
 
-    // With embedding unavailable, FTS won't match "quantum" for a query like "particle physics"
-    // but the KNN path should still surface it if vectors align.
-    // Since we can't control the embedding endpoint, verify the code doesn't crash
-    // and the KNN path is available.
-    expect(db.vecAvailable).toBeDefined();
-    const knnResults = db.knnSearch(fakeVec, 10);
-    expect(knnResults).toContainEqual({ nodeId: node.id, distance: expect.any(Number) });
+    // fetch stub returns the same vector for any embedding request
+    const fetchStub = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: [{ embedding: vec }] }),
+    }));
+    vi.stubGlobal('fetch', fetchStub as any);
+
+    const results = await searchHybrid(db, 'quarterly revenue forecast', 5, undefined, undefined, DEFAULT_CONFIG);
+    expect(results.find(r => r.node.id === id)).toBeTruthy(); // no lexical overlap; only KNN can find it
+    vi.unstubAllGlobals();
   });
 
-  // B.6: No node-embedding calls in the query path
-  it('does not call batchEmbed on candidate nodes during search', async () => {
-    const config = { ...DEFAULT_CONFIG, embeddingEndpoint: 'http://localhost:65535/v1/embeddings' };
-    db.saveNode({ category: 'knowledge', content: 'Search me please' });
+  // 4.4: No candidate embedding in the query path
+  it('issues exactly one embedding request during search', async () => {
+    if (!db.vecAvailable) return;
+    const vec = Array.from({ length: 768 }, () => 0.01);
+    const { id } = db.saveNode({ category: 'knowledge', content: 'alpha beta gamma' });
+    db.storeVector(id, vec, DEFAULT_CONFIG.embeddingModel);
 
-    // With embedding unavailable, the FTS-only path runs without batchEmbed
-    const results = await searchHybrid(db, 'search', 10, undefined, undefined, config);
-    expect(Array.isArray(results)).toBe(true);
-    // The key assertion: searchHybrid no longer contains a batchEmbed call for candidates
-    // (verified by code inspection — the function no longer calls batchEmbed)
+    const fetchStub = vi.fn(async () => ({ ok: true, json: async () => ({ data: [{ embedding: vec }] }) }));
+    vi.stubGlobal('fetch', fetchStub as any);
+
+    await searchHybrid(db, 'alpha', 5, undefined, undefined, DEFAULT_CONFIG);
+    expect(fetchStub).toHaveBeenCalledTimes(1); // query embedding only
+    vi.unstubAllGlobals();
+  });
+
+  // 4.5: Filter excludes null subcategory consistently
+  it('subcategory filter excludes null-subcategory nodes (matches FTS semantics)', async () => {
+    const config = { ...DEFAULT_CONFIG, embeddingEndpoint: 'http://localhost:65535/v1/embeddings' };
+    db.saveNode({ category: 'knowledge', subcategory: 'fact', content: 'has subcategory' });
+    db.saveNode({ category: 'knowledge', subcategory: null, content: 'no subcategory' });
+
+    const results = await searchHybrid(db, '', 10, ['knowledge'], ['fact'], config);
+    expect(results.every(r => r.node.subcategory === 'fact')).toBe(true);
   });
 });
 

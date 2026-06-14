@@ -45,7 +45,7 @@ export interface KgConfig {
 
 export const DEFAULT_CONFIG: KgConfig = {
   graphPath: '',
-  embeddingEndpoint: 'http://10.1.1.145:1234/v1/embeddings',
+  embeddingEndpoint: 'http://localhost:1234/v1/embeddings',
   embeddingModel: 'nomic-embed-text-v1.5',
   maxResults: 10,
   ftsF5Weight: 0.4,
@@ -308,7 +308,8 @@ export async function searchHybrid(
   const now = Date.now();
   const maxFreq = db.getMaxFrequency();
   const maxAccess = db.getMaxAccessCount();
-  const k = maxResults * 3; // fetch extra candidates for post-filtering
+  const filtersActive = (categories?.length ?? 0) > 0 || (subcategories?.length ?? 0) > 0;
+  const k = maxResults * (filtersActive ? 6 : 3); // over-fetch under filters (post-filtered)
 
   // Phase 1: FTS5 lexical candidates
   const ftsResults = db.searchFTS5(query, k, categories, subcategories);
@@ -366,8 +367,8 @@ export async function searchHybrid(
       // Already in FTS set — add KNN distance
       existing.knnDistance = knn.distance;
     } else {
-      // Pure KNN hit — hydrate the node
-      const node = db.getNode(knn.nodeId);
+      // Pure KNN hit — hydrate the node WITHOUT bumping access tracking
+      const node = db.peekNode(knn.nodeId);
       if (node) {
         candidateMap.set(knn.nodeId, {
           node,
@@ -385,7 +386,10 @@ export async function searchHybrid(
     const filtered = new Map<string, CandidateEntry>();
     for (const [id, c] of candidates) {
       if (categories && categories.length > 0 && !categories.includes(c.node.category)) continue;
-      if (subcategories && subcategories.length > 0 && c.node.subcategory && !subcategories.includes(c.node.subcategory)) continue;
+      if (
+        subcategories && subcategories.length > 0 &&
+        !(c.node.subcategory && subcategories.includes(c.node.subcategory))
+      ) continue;
       filtered.set(id, c);
     }
     return filtered;
