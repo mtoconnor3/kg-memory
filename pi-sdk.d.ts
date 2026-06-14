@@ -8,8 +8,8 @@ declare module '@earendil-works/pi-coding-agent' {
       execute: (toolCallId: string, params: Record<string, any>) => Promise<any>;
     }): void;
     on(event: string, handler: (...args: any[]) => any): void;
-    registerCommand(name: string, opts: { description: string; handler: () => any }): void;
-    ui?: { notify?: (message: string) => void };
+    registerCommand(name: string, opts: { description: string; handler: (args: any, ctx: ExtensionCommandContext) => void | Promise<void> }): void;
+    ui?: { notify?: (message: string, type?: string) => void };
     systemPrompt?: { inject?: (text: string) => void };
   }
 }
