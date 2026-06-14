@@ -57,6 +57,34 @@ describe('cosineSimilarity', () => {
     const b = [-1, 0, 0];
     expect(cosineSimilarity(a, b)).toBe(0);
   });
+
+  // A.4: Non-unit-length vectors that expose the old bug
+  it('handles non-unit-length orthogonal vectors: [3,0] vs [0,4] → 0', () => {
+    const a = [3, 0];
+    const b = [0, 4];
+    expect(cosineSimilarity(a, b)).toBeCloseTo(0, 5);
+  });
+
+  it('handles parallel vectors with different magnitudes: [1,2] vs [2,4] → 1.0', () => {
+    // This case FAILS under the old bug (normB computed from a instead of b)
+    // because magnitude collapses to ‖a‖² instead of ‖a‖·‖b‖
+    const a = [1, 2];
+    const b = [2, 4];
+    expect(cosineSimilarity(a, b)).toBeCloseTo(1.0, 5);
+  });
+
+  it('handles non-unit-length anti-parallel vectors → 0 (clamped)', () => {
+    const a = [3, 4];
+    const b = [-6, -8];
+    expect(cosineSimilarity(a, b)).toBe(0); // clamped from -1
+  });
+
+  it('handles non-unit-length vectors with known cosine', () => {
+    // a = [1, 0], b = [1, 1] → cosine = 1/√2 ≈ 0.7071
+    const a = [1, 0];
+    const b = [1, 1];
+    expect(cosineSimilarity(a, b)).toBeCloseTo(1 / Math.sqrt(2), 5);
+  });
 });
 
 describe('computeCompositeScore', () => {
@@ -79,7 +107,7 @@ describe('validateConfig', () => {
   it('merges partial config with defaults', () => {
     const config = validateConfig({ maxResults: 20 });
     expect(config.maxResults).toBe(20);
-    expect(config.embeddingEndpoint).toBe(DEFAULT_CONFIG.embeddingEndpoint);
+    expect(config.embeddingEndpoint).toBe('http://localhost:1234/v1/embeddings');
   });
 
   it('validates weights per-field, not all-or-nothing (CFG-2)', () => {
@@ -129,20 +157,6 @@ describe('searchHybrid', () => {
     expect(results.length).toBeGreaterThanOrEqual(0); // Should not throw
   });
 
-  it('uses capped fallback on FTS miss (SR-1)', async () => {
-    // Point to non-existent endpoint so we get FTS-only path
-    const config = { ...DEFAULT_CONFIG, embeddingEndpoint: 'http://localhost:65535/v1/embeddings' };
-
-    // Add nodes that won't match "xyznonexistent"
-    for (let i = 0; i < 100; i++) {
-      db.saveNode({ category: 'knowledge', content: `Item ${i} description` });
-    }
-
-    const results = await searchHybrid(db, 'xyznonexistent', 10, undefined, undefined, config);
-    // Should return results (fallback path) but not hang
-    expect(Array.isArray(results)).toBe(true);
-  });
-
   it('empty query returns all nodes', async () => {
     const config = { ...DEFAULT_CONFIG, embeddingEndpoint: 'http://localhost:65535/v1/embeddings' };
     db.saveNode({ category: 'knowledge', content: 'Alpha' });
@@ -150,6 +164,50 @@ describe('searchHybrid', () => {
 
     const results = await searchHybrid(db, '', 10, undefined, undefined, config);
     expect(results.length).toBe(2);
+  });
+
+  // 4.3: Vector search is no longer gated by FTS
+  it('surfaces a lexically-disjoint node through the KNN path', async () => {
+    if (!db.vecAvailable) return;
+    const vec = Array.from({ length: 768 }, (_, i) => Math.sin(i));
+    const { id } = db.saveNode({ category: 'knowledge', content: 'mitochondria are organelles' });
+    db.storeVector(id, vec, DEFAULT_CONFIG.embeddingModel);
+
+    // fetch stub returns the same vector for any embedding request
+    const fetchStub = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: [{ embedding: vec }] }),
+    }));
+    vi.stubGlobal('fetch', fetchStub as any);
+
+    const results = await searchHybrid(db, 'quarterly revenue forecast', 5, undefined, undefined, DEFAULT_CONFIG);
+    expect(results.find(r => r.node.id === id)).toBeTruthy(); // no lexical overlap; only KNN can find it
+    vi.unstubAllGlobals();
+  });
+
+  // 4.4: No candidate embedding in the query path
+  it('issues exactly one embedding request during search', async () => {
+    if (!db.vecAvailable) return;
+    const vec = Array.from({ length: 768 }, () => 0.01);
+    const { id } = db.saveNode({ category: 'knowledge', content: 'alpha beta gamma' });
+    db.storeVector(id, vec, DEFAULT_CONFIG.embeddingModel);
+
+    const fetchStub = vi.fn(async () => ({ ok: true, json: async () => ({ data: [{ embedding: vec }] }) }));
+    vi.stubGlobal('fetch', fetchStub as any);
+
+    await searchHybrid(db, 'alpha', 5, undefined, undefined, DEFAULT_CONFIG);
+    expect(fetchStub).toHaveBeenCalledTimes(1); // query embedding only
+    vi.unstubAllGlobals();
+  });
+
+  // 4.5: Filter excludes null subcategory consistently
+  it('subcategory filter excludes null-subcategory nodes (matches FTS semantics)', async () => {
+    const config = { ...DEFAULT_CONFIG, embeddingEndpoint: 'http://localhost:65535/v1/embeddings' };
+    db.saveNode({ category: 'knowledge', subcategory: 'fact', content: 'has subcategory' });
+    db.saveNode({ category: 'knowledge', subcategory: null, content: 'no subcategory' });
+
+    const results = await searchHybrid(db, '', 10, ['knowledge'], ['fact'], config);
+    expect(results.every(r => r.node.subcategory === 'fact')).toBe(true);
   });
 });
 

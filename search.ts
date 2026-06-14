@@ -45,7 +45,7 @@ export interface KgConfig {
 
 export const DEFAULT_CONFIG: KgConfig = {
   graphPath: '',
-  embeddingEndpoint: 'http://192.268.1.1:1234/v1/embeddings',
+  embeddingEndpoint: 'http://localhost:1234/v1/embeddings',
   embeddingModel: 'nomic-embed-text-v1.5',
   maxResults: 10,
   ftsF5Weight: 0.4,
@@ -199,7 +199,7 @@ export function cosineSimilarity(a: number[], b: number[]): number {
   for (let i = 0; i < a.length; i++) {
     dotProduct += a[i] * b[i];
     normA += a[i] * a[i];
-    normB += a[i] * a[i];
+    normB += b[i] * b[i];
   }
 
   const magnitude = Math.sqrt(normA) * Math.sqrt(normB);
@@ -282,12 +282,13 @@ function computeFreshnessScore(lastAccessedAt: number, now: number): number {
 // ---------------------------------------------------------------------------
 
 /**
- * Hybrid search: FTS5 + vector cosine similarity.
+ * Hybrid search: FTS5 (BM25) + vector KNN (cosine) unioned as first-class sources.
  *
- * - FTS5 provides BM25 candidate set
- * - Vector similarity refines ranking when LMStudio is available
- * - On FTS miss, falls back to capped candidate set (SR-1)
- * - Unified scoring across all paths (SR-3)
+ * - FTS5 provides lexical candidates via BM25
+ * - vec0 KNN provides semantic candidates (no longer gated by FTS)
+ * - Candidate sets are unioned by node ID, then scored with composite formula
+ * - On embedding unavailability, falls back to FTS-only (graceful degradation)
+ * - No node-embedding in the query path — vectors are populated at write/index time
  */
 export async function searchHybrid(
   db: KnowledgeGraphDB,
@@ -307,16 +308,20 @@ export async function searchHybrid(
   const now = Date.now();
   const maxFreq = db.getMaxFrequency();
   const maxAccess = db.getMaxAccessCount();
+  const filtersActive = (categories?.length ?? 0) > 0 || (subcategories?.length ?? 0) > 0;
+  const k = maxResults * (filtersActive ? 6 : 3); // over-fetch under filters (post-filtered)
 
-  // Phase 1: Get FTS5 candidate set
-  const ftsResults = db.searchFTS5(query, maxResults * 3, categories, subcategories);
+  // Phase 1: FTS5 lexical candidates
+  const ftsResults = db.searchFTS5(query, k, categories, subcategories);
 
   // Phase 2: Try vector search
   const vectorTimeout = trimmedQuery.length < 50 ? config.inputSearchTimeout : 10000;
   const queryEmbedding = await getQueryEmbedding(query, config, vectorTimeout);
 
   if (!queryEmbedding) {
-    // LMStudio unavailable — return FTS5 results with unified scoring (SR-3)
+    // LMStudio unavailable — return FTS5 results with unified scoring (SR-3).
+    // NOTE: This fallback is acceptable only at the curated-node scale.
+    // vec_nodes KNN is required before the chunk tier lands.
     console.warn('[kg-memory] Embedding unavailable, falling back to pure FTS5');
     return ftsResults
       .map(hit => ({
@@ -333,68 +338,91 @@ export async function searchHybrid(
       .slice(0, maxResults);
   }
 
-  // Phase 3: Score candidates by vector similarity
-  // If FTS returned results, use them as candidates
-  // If FTS returned 0, use a capped fallback set (SR-1)
-  let candidates: SearchHit[] = ftsResults;
-  if (candidates.length === 0) {
-    // Cap fallback to 50 nodes, sorted by recency/frequency (SR-1)
-    const fallbackNodes = db.getFallbackCandidates(50, categories, subcategories);
-    candidates = fallbackNodes.map(node => ({
-      node,
-      bm25Score: 0,
+  // Phase 3: KNN semantic candidates (first-class, not gated by FTS)
+  const knnResults = db.knnSearch(queryEmbedding, k);
+
+  // Phase 4: Union FTS and KNN candidates by node ID
+  // For each unique candidate, compute all score components
+  const candidateMap = new Map<string, {
+    node: KnowledgeNode;
+    bm25Score: number;
+    vectorScore: number | null;
+    knnDistance: number | null;
+  }>();
+
+  // Index FTS results by node ID
+  for (const hit of ftsResults) {
+    candidateMap.set(hit.node.id, {
+      node: hit.node,
+      bm25Score: hit.bm25Score,
       vectorScore: null,
-      frequencyBoost: 0,
-      freshnessScore: 0,
-      compositeScore: 0,
-      edges: db.getNodeEdges(node.id),
-    }));
+      knnDistance: null,
+    });
   }
 
-  // Batch-embed unembedded nodes (SR-1)
-  const unembeddedNodes = candidates
-    .filter(hit => hit.vectorScore === null)
-    .map(hit => hit.node);
-
-  if (unembeddedNodes.length > 0) {
-    const contents = unembeddedNodes.map(n => n.content);
-    const embeddings = await batchEmbed(contents, config, vectorTimeout);
-
-    for (let i = 0; i < unembeddedNodes.length; i++) {
-      const node = unembeddedNodes[i];
-      const embedding = embeddings[i];
-      if (embedding) {
-        // Store with model/dim stamp (SR-2)
-        db.storeVector(node.id, embedding, config.embeddingModel);
+  // Index KNN results by node ID
+  for (const knn of knnResults) {
+    const existing = candidateMap.get(knn.nodeId);
+    if (existing) {
+      // Already in FTS set — add KNN distance
+      existing.knnDistance = knn.distance;
+    } else {
+      // Pure KNN hit — hydrate the node WITHOUT bumping access tracking
+      const node = db.peekNode(knn.nodeId);
+      if (node) {
+        candidateMap.set(knn.nodeId, {
+          node,
+          bm25Score: 0,
+          vectorScore: null,
+          knnDistance: knn.distance,
+        });
       }
     }
   }
 
-  // Score each candidate
+  // Phase 5: Apply category/subcategory filters to unioned candidates
+  type CandidateEntry = { node: KnowledgeNode; bm25Score: number; vectorScore: number | null; knnDistance: number | null };
+  const filterCandidates = (candidates: Map<string, CandidateEntry>) => {
+    const filtered = new Map<string, CandidateEntry>();
+    for (const [id, c] of candidates) {
+      if (categories && categories.length > 0 && !categories.includes(c.node.category)) continue;
+      if (
+        subcategories && subcategories.length > 0 &&
+        !(c.node.subcategory && subcategories.includes(c.node.subcategory))
+      ) continue;
+      filtered.set(id, c);
+    }
+    return filtered;
+  };
+
+  const filteredCandidates = filterCandidates(candidateMap);
+
+  // Phase 6: Score each candidate
   const scoredResults: SearchHit[] = [];
-  for (const candidate of candidates) {
+  for (const candidate of filteredCandidates.values()) {
     const { node } = candidate;
 
-    // Get stored embedding (check model/dim match — SR-2)
-    const vectorData = db.getVector(node.id);
+    // Vector score: prefer KNN distance (1 - distance) if available,
+    // otherwise compute cosineSimilarity from stored vector
     let vectorScore: number | null = null;
-
-    if (vectorData) {
-      if (vectorData.model === config.embeddingModel && vectorData.dim === queryEmbedding.length) {
-        // Dimensions match — compute similarity
-        try {
-          vectorScore = cosineSimilarity(queryEmbedding, vectorData.embedding);
-        } catch {
-          // Fail soft — skip vector for this node (SR-2)
-          vectorScore = null;
+    if (candidate.knnDistance !== null) {
+      // KNN hit — similarity = 1 - cosine distance
+      vectorScore = Math.max(0, 1 - candidate.knnDistance);
+    } else {
+      // FTS-only hit — compute cosine from stored vector
+      const vectorData = db.getVector(node.id);
+      if (vectorData) {
+        if (vectorData.model === config.embeddingModel && vectorData.dim === queryEmbedding.length) {
+          try {
+            vectorScore = cosineSimilarity(queryEmbedding, vectorData.embedding);
+          } catch {
+            vectorScore = null;
+          }
         }
-      } else {
-        // Model or dim mismatch — skip, will be re-embedded on next write (SR-2)
-        vectorScore = null;
       }
     }
 
-    // Compute all scores using unified formula (SR-3)
+    // Frequency + freshness (unchanged)
     const frequencyBoost = computeFrequencyBoost(node.frequency, node.accessCount, maxFreq, maxAccess);
     const freshnessScore = computeFreshnessScore(node.lastAccessedAt, now);
 
@@ -413,7 +441,7 @@ export async function searchHybrid(
       frequencyBoost,
       freshnessScore,
       compositeScore,
-      edges: candidate.edges,
+      edges: db.getNodeEdges(node.id),
     });
   }
 

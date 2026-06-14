@@ -38,9 +38,54 @@ import {
 import {
   DEFAULT_CONFIG,
   validateConfig,
+  batchEmbed,
+  getEmbedding,
   type KgConfig,
 } from './search.ts';
 import { normalizeSubcategory, normalizeEdgeType } from './normalize.ts';
+
+// ---------------------------------------------------------------------------
+// Vector backfill (B.4: one-time migration for existing nodes)
+// ---------------------------------------------------------------------------
+
+/**
+ * Embed nodes that lack vectors, batched to avoid blocking startup.
+ * Idempotent — only processes nodes with no existing vector.
+ */
+async function backfillMissingVectors(db: ReturnType<typeof openKnowledgeGraph>, config: KgConfig): Promise<void> {
+  // Find nodes without vectors
+  const rows = db.getDb().prepare(`
+    SELECT n.id, n.content FROM nodes n
+    LEFT JOIN node_vectors nv ON nv.node_id = n.id
+    WHERE nv.node_id IS NULL
+  `).all() as Array<{ id: string; content: string }>;
+
+  if (rows.length === 0) {
+    return; // Nothing to backfill
+  }
+
+  console.log(`[kg-memory] Backfilling vectors for ${rows.length} node(s) without embeddings...`);
+
+  // Batch embed and store
+  const batchSize = 25;
+  for (let i = 0; i < rows.length; i += batchSize) {
+    const batch = rows.slice(i, i + batchSize);
+    const contents = batch.map(r => r.content);
+    const embeddings = await batchEmbed(contents, config, 10000);
+
+    for (let j = 0; j < batch.length; j++) {
+      const embedding = embeddings[j];
+      if (embedding) {
+        db.storeVector(batch[j].id, embedding, config.embeddingModel);
+      }
+    }
+
+    // Yield between batches to avoid blocking
+    await new Promise(resolve => setImmediate(resolve));
+  }
+
+  console.log(`[kg-memory] Vector backfill complete for ${rows.length} node(s)`);
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -82,17 +127,35 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   console.log(`[kg-memory] Knowledge graph initialized: ${graphPath}`);
   console.log(`[kg-memory] Embedding: ${searchConfig.embeddingEndpoint} (model: ${searchConfig.embeddingModel})`);
 
-  // Register tools
+  // Register first so the agent is usable immediately
   registerTools(db, searchConfig, pi);
-
-  // Register hooks
   registerHooks(db, searchConfig, pi);
-
-  // Register commands
   registerCommands(db, searchConfig, pi);
+
+  // --- index maintenance below; must not block init on the embedding endpoint ---
+
+  // Detect an embedding-model change and purge vectors for re-embed.
+  // A model swap at a *different* dimension also requires bumping EMBED_DIM
+  // and restarting (the float[N] width is fixed at table creation). The purge
+  // handles the same-dimension case fully.
+  const storedModel = db.getMeta('embedding_model');
+  if (storedModel && storedModel !== searchConfig.embeddingModel) {
+    console.log(`[kg-memory] Embedding model changed (${storedModel} -> ${searchConfig.embeddingModel}); purging vectors for re-embed`);
+    db.purgeVectors();
+  }
+  db.setMeta('embedding_model', searchConfig.embeddingModel);
+
+  // Repopulate the KNN index from any surviving node_vectors (sync, no network)
+  const backfilled = db.backfillVecIndex();
+  if (backfilled > 0) console.log(`[kg-memory] Backfilled ${backfilled} vectors into vec_nodes`);
 
   // Auto-prune query log on startup
   pruneOldEntries(db, searchConfig.queryLogLimit);
+
+  // Embed any nodes still lacking vectors, without blocking startup.
+  void backfillMissingVectors(db, searchConfig).catch(err =>
+    console.warn('[kg-memory] Vector backfill error:', (err as Error).message),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +196,18 @@ function registerTools(db: ReturnType<typeof openKnowledgeGraph>, config: KgConf
         subcategory: params.subcategory,
         properties: params.properties,
       });
+
+      // Embed-on-create so the node is KNN-searchable within this session.
+      // Fail soft: FTS still works if the endpoint is down.
+      if (result.created && result.nodeId) {
+        try {
+          const emb = await getEmbedding(params.content, config, 10000);
+          if (emb) db.storeVector(result.nodeId, emb, config.embeddingModel);
+        } catch (err) {
+          console.warn('[kg-memory] embed-on-add failed:', (err as Error).message);
+        }
+      }
+
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     },
   });
