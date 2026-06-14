@@ -38,9 +38,53 @@ import {
 import {
   DEFAULT_CONFIG,
   validateConfig,
+  batchEmbed,
   type KgConfig,
 } from './search.ts';
 import { normalizeSubcategory, normalizeEdgeType } from './normalize.ts';
+
+// ---------------------------------------------------------------------------
+// Vector backfill (B.4: one-time migration for existing nodes)
+// ---------------------------------------------------------------------------
+
+/**
+ * Embed nodes that lack vectors, batched to avoid blocking startup.
+ * Idempotent — only processes nodes with no existing vector.
+ */
+async function backfillMissingVectors(db: ReturnType<typeof openKnowledgeGraph>, config: KgConfig): Promise<void> {
+  // Find nodes without vectors
+  const rows = db.getDb().prepare(`
+    SELECT n.id, n.content FROM nodes n
+    LEFT JOIN node_vectors nv ON nv.node_id = n.id
+    WHERE nv.node_id IS NULL
+  `).all() as Array<{ id: string; content: string }>;
+
+  if (rows.length === 0) {
+    return; // Nothing to backfill
+  }
+
+  console.log(`[kg-memory] Backfilling vectors for ${rows.length} node(s) without embeddings...`);
+
+  // Batch embed and store
+  const batchSize = 25;
+  for (let i = 0; i < rows.length; i += batchSize) {
+    const batch = rows.slice(i, i + batchSize);
+    const contents = batch.map(r => r.content);
+    const embeddings = await batchEmbed(contents, config, 10000);
+
+    for (let j = 0; j < batch.length; j++) {
+      const embedding = embeddings[j];
+      if (embedding) {
+        db.storeVector(batch[j].id, embedding, config.embeddingModel);
+      }
+    }
+
+    // Yield between batches to avoid blocking
+    await new Promise(resolve => setImmediate(resolve));
+  }
+
+  console.log(`[kg-memory] Vector backfill complete for ${rows.length} node(s)`);
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -81,6 +125,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   console.log(`[kg-memory] Knowledge graph initialized: ${graphPath}`);
   console.log(`[kg-memory] Embedding: ${searchConfig.embeddingEndpoint} (model: ${searchConfig.embeddingModel})`);
+
+  // Backfill vec_nodes KNN index from existing node_vectors (idempotent)
+  const backfilled = db.backfillVecIndex();
+  if (backfilled > 0) {
+    console.log(`[kg-memory] Backfilled ${backfilled} vectors into vec_nodes KNN index`);
+  }
+
+  // Embed any nodes that lack vectors (one-time backfill for existing content)
+  await backfillMissingVectors(db, searchConfig);
 
   // Register tools
   registerTools(db, searchConfig, pi);

@@ -9,6 +9,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { createHash } from 'crypto';
+import * as sqliteVec from '@photostructure/sqlite-vec';
 
 // ---------------------------------------------------------------------------
 // Schema (mirrors IMPLEMENTATION_PLAN.md)
@@ -92,6 +93,17 @@ CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);
 CREATE INDEX IF NOT EXISTS idx_node_vectors_node ON node_vectors(node_id);
 `;
 
+// vec_nodes virtual table — created separately after loading sqlite-vec.
+// Uses implicit rowid (matches nodes.rowid for JOIN). Distance metric: cosine.
+// Dimension: 768 (matches nomic-embed-text-v1.5).
+// NOTE: If the embedding model changes dimension, this table must be dropped and rebuilt.
+// The canonical storage remains node_vectors (which holds model/dim provenance).
+const VEC_SCHEMA_SQL = `
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_nodes USING vec0(
+  embedding float[768] distance_metric=cosine
+);
+`;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -136,9 +148,11 @@ export interface SearchHit {
 export class KnowledgeGraphDB {
   private db: Database.Database;
   private dbPath: string;
+  public vecAvailable: boolean;
 
   constructor(dbPath: string) {
     this.dbPath = dbPath;
+    this.vecAvailable = false;
 
     // Ensure directory exists
     const dir = path.dirname(dbPath);
@@ -155,8 +169,21 @@ export class KnowledgeGraphDB {
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('cache_size = -64000'); // 64MB
 
-    // Execute schema
+    // Load sqlite-vec extension for KNN vector search
+    try {
+      sqliteVec.load(this.db);
+      this.vecAvailable = true;
+    } catch (err) {
+      console.warn('[kg-memory] sqlite-vec unavailable, vector KNN disabled:', (err as Error).message);
+    }
+
+    // Execute schema (regular tables and FTS5)
     this.db.exec(SCHEMA_SQL);
+
+    // Create vec_nodes virtual table only if the extension loaded
+    if (this.vecAvailable) {
+      this.db.exec(VEC_SCHEMA_SQL);
+    }
 
     // Run migrations (add columns if they don't exist)
     this.migrate();
@@ -386,6 +413,14 @@ export class KnowledgeGraphDB {
 
     // Remove vector embedding
     this.db.prepare('DELETE FROM node_vectors WHERE node_id = ?').run(id);
+
+    // Remove from vec_nodes KNN index (keyed by integer rowid)
+    if (this.vecAvailable) {
+      const rowidRow = this.db.prepare('SELECT rowid FROM nodes WHERE id = ?').get(id) as { rowid: number } | undefined;
+      if (rowidRow) {
+        this.db.prepare('DELETE FROM vec_nodes WHERE rowid = CAST(? AS INTEGER)').run(rowidRow.rowid);
+      }
+    }
 
     const result = this.db.prepare('DELETE FROM nodes WHERE id = ?').run(id);
 
@@ -978,7 +1013,7 @@ export class KnowledgeGraphDB {
   // Vector storage (for search layer — SR-2)
   // -----------------------------------------------------------------------
 
-  storeVector(nodeId: string, embedding: number[], model: string): void {
+  storeVector(nodeId: string, embedding: number[], model: string, dim: number = 768): void {
     const buffer = Buffer.from(new Float32Array(embedding).buffer);
     try {
       this.db.prepare(
@@ -987,6 +1022,75 @@ export class KnowledgeGraphDB {
     } catch (err) {
       console.warn('[kg-memory] Failed to store embedding:', (err as Error).message);
     }
+
+    // Also upsert into vec_nodes KNN index (keyed by nodes.rowid as integer).
+    // Guard: only when vec available and dimensions match the vec0 table (768).
+    if (this.vecAvailable && embedding.length === dim) {
+      const rowidRow = this.db.prepare('SELECT rowid FROM nodes WHERE id = ?').get(nodeId) as { rowid: number } | undefined;
+      if (rowidRow) {
+        try {
+          // vec0 requires actual INTEGER type — CAST ensures SQLite converts the bound REAL
+          this.db.prepare(
+            'INSERT OR REPLACE INTO vec_nodes(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)'
+          ).run(rowidRow.rowid, buffer);
+        } catch (err) {
+          console.warn('[kg-memory] Failed to upsert vec_nodes:', (err as Error).message);
+        }
+      }
+    }
+  }
+
+  /**
+   * KNN search using sqlite-vec vec0 index.
+   * Returns nearest node_ids by cosine distance. Empty array if vec unavailable.
+   * Cosine similarity = 1 - distance under distance_metric=cosine.
+   */
+  knnSearch(queryEmbedding: number[], k: number): Array<{ nodeId: string; distance: number }> {
+    if (!this.vecAvailable) return [];
+    const buf = Buffer.from(new Float32Array(queryEmbedding).buffer);
+    const rows = this.db.prepare(`
+      SELECT n.id AS nodeId, v.distance
+      FROM vec_nodes v
+      JOIN nodes n ON n.rowid = CAST(v.rowid AS INTEGER)
+      WHERE v.embedding MATCH ? AND k = ?
+      ORDER BY v.distance
+    `).all(buf, k) as Array<{ nodeId: string; distance: number }>;
+    return rows;
+  }
+
+  /**
+   * Backfill vec_nodes from node_vectors on startup.
+   * Idempotent — no-op when counts match. Returns the number of rows processed.
+   */
+  backfillVecIndex(): number {
+    if (!this.vecAvailable) return 0;
+
+    const vecCount = (this.db.prepare('SELECT COUNT(*) AS cnt FROM vec_nodes').get() as { cnt: number }).cnt;
+    const nvCount = (this.db.prepare('SELECT COUNT(*) AS cnt FROM node_vectors').get() as { cnt: number }).cnt;
+
+    if (vecCount >= nvCount) {
+      // Already up to date
+      return 0;
+    }
+
+    // Upsert all node_vectors rows into vec_nodes
+    const rows = this.db.prepare(
+      'SELECT nv.node_id, nv.embedding, n.rowid FROM node_vectors nv JOIN nodes n ON n.id = nv.node_id'
+    ).all() as Array<{ node_id: string; embedding: Buffer; rowid: number }>;
+
+    let count = 0;
+    for (const row of rows) {
+      try {
+        // vec0 requires actual INTEGER type — CAST ensures SQLite converts the bound REAL
+        this.db.prepare(
+          'INSERT OR REPLACE INTO vec_nodes(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)'
+        ).run(row.rowid, row.embedding);
+        count++;
+      } catch (err) {
+        console.warn(`[kg-memory] Backfill failed for node ${row.node_id}:`, (err as Error).message);
+      }
+    }
+    return count;
   }
 
   getVector(nodeId: string): { embedding: number[]; model: string; dim: number } | null {
