@@ -466,18 +466,18 @@ function registerCommands(db: ReturnType<typeof openKnowledgeGraph>, config: KgC
   // /kg — Graph overview (node count, edges, categories, top nodes)
   pi.registerCommand('kg', {
     description: 'Show knowledge graph overview: node count, edge count, category distribution, most surfaced nodes.',
-    handler: async () => {
+    handler: async (_args, ctx) => {
       const report = generateGraphOverview(db);
-      return report;
+      ctx.ui?.notify?.(report, 'info');
     },
   });
 
   // /kg-query — Query log analytics (gaps, query types, agent actions, growth)
   pi.registerCommand('kg-query', {
     description: 'Show query log analytics: most surfaced nodes, zero-result gaps, category distribution, query types, agent actions.',
-    handler: async () => {
+    handler: async (_args, ctx) => {
       const report = generateFormattedReport(db, '', { queryLogLimit: config.queryLogLimit });
-      return report;
+      ctx.ui?.notify?.(report, 'info');
     },
   });
 }
