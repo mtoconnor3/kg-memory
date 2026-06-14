@@ -45,7 +45,7 @@ export interface KgConfig {
 
 export const DEFAULT_CONFIG: KgConfig = {
   graphPath: '',
-  embeddingEndpoint: 'http://192.268.1.1:1234/v1/embeddings',
+  embeddingEndpoint: 'http://10.1.1.145:1234/v1/embeddings',
   embeddingModel: 'nomic-embed-text-v1.5',
   maxResults: 10,
   ftsF5Weight: 0.4,
