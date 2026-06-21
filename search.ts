@@ -75,7 +75,6 @@ export async function getEmbedding(
   timeoutMs: number = 10000,
 ): Promise<number[] | null> {
   try {
-    console.log(`[kg-memory] Calling embedding endpoint: ${config.embeddingEndpoint}`);
     // Apply nomic task prefix (SR-4)
     const input = Array.isArray(text) ? text : [text];
     const prefixed = input.map(t => `search_document: ${t}`);
@@ -119,7 +118,6 @@ export async function getQueryEmbedding(
   timeoutMs: number = 10000,
 ): Promise<number[] | null> {
   try {
-    console.log(`[kg-memory] Calling embedding endpoint: ${config.embeddingEndpoint}`);
     const response = await fetch(config.embeddingEndpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
