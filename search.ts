@@ -100,7 +100,11 @@ export async function getEmbedding(
     // Return first embedding for single-text calls, or first for batch
     return data.data[0]?.embedding ?? null;
   } catch (err) {
-    console.warn('[kg-memory] Embedding API unavailable:', (err as Error).message);
+    const error = err as Error;
+    console.warn(`[kg-memory] Embedding API unavailable: ${error.message}`);
+    if (error.cause) {
+      console.warn(`[kg-memory]  cause: ${(error.cause as Error).message}`);
+    }
     return null;
   }
 }
@@ -119,7 +123,7 @@ export async function getQueryEmbedding(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: config.embeddingModel,
-        input: `search_query: ${query}`,
+        input: [`search_query: ${query}`],
       }),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -132,7 +136,11 @@ export async function getQueryEmbedding(
     const data = await response.json() as { data: Array<{ embedding: number[] }> };
     return data.data?.[0]?.embedding ?? null;
   } catch (err) {
-    console.warn('[kg-memory] Embedding API unavailable:', (err as Error).message);
+    const error = err as Error;
+    console.warn(`[kg-memory] Embedding API unavailable: ${error.message}`);
+    if (error.cause) {
+      console.warn(`[kg-memory]  cause: ${(error.cause as Error).message}`);
+    }
     return null;
   }
 }

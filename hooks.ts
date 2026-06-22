@@ -102,7 +102,7 @@ export async function onBeforeAgentStart(
   }
 
   // Single broad search instead of 6 sequential queries (HK-1)
-  const results = await searchHybrid(db, '', config.maxResults * 2);
+  const results = await searchHybrid(db, '', config.maxResults * 2, undefined, undefined, config);
 
   if (results.length === 0) {
     return { injection: '', nodeIds: [] };
